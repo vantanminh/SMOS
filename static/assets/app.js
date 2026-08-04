@@ -67,6 +67,28 @@
   function showApp(show) {
     $("#app").classList.toggle("hidden", !show);
     $("#auth-gate").classList.toggle("hidden", show);
+    if (!show) closeNav();
+  }
+
+  function openNav() {
+    document.body.classList.add("nav-open");
+    const btn = $("#nav-open");
+    if (btn) btn.setAttribute("aria-expanded", "true");
+    const backdrop = $("#nav-backdrop");
+    if (backdrop) backdrop.hidden = false;
+  }
+
+  function closeNav() {
+    document.body.classList.remove("nav-open");
+    const btn = $("#nav-open");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+    const backdrop = $("#nav-backdrop");
+    if (backdrop) backdrop.hidden = true;
+  }
+
+  function toggleNav() {
+    if (document.body.classList.contains("nav-open")) closeNav();
+    else openNav();
   }
 
   function renderGate() {
@@ -109,7 +131,7 @@
             <label>Enter 6-digit code from your app to confirm
               <input class="otp-input" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code" />
             </label>
-            <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
+            <div class="auth-actions">
               <button class="btn" type="submit">Verify & enable 2FA</button>
               <button class="btn secondary" type="button" id="skip-totp">Skip for now</button>
             </div>
@@ -130,8 +152,10 @@
             <label>OTP code
               <input class="otp-input" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code" />
             </label>
-            <button class="btn" type="submit">Verify</button>
-            <button class="btn secondary" type="button" id="back-login">Back</button>
+            <div class="auth-actions">
+              <button class="btn" type="submit">Verify</button>
+              <button class="btn secondary" type="button" id="back-login">Back</button>
+            </div>
             <div id="gate-msg"></div>
           </form>
         </div>`;
@@ -250,6 +274,7 @@
   async function enterDashboard() {
     state.gate = null;
     showApp(true);
+    closeNav();
     parseRoute();
     try {
       await loadHealth();
@@ -315,15 +340,27 @@
   }
 
   function setHealthPill(ok, text) {
-    const el = $("#health-pill");
-    el.textContent = text;
-    el.className = "pill " + (ok ? "ok" : "bad");
+    ["#health-pill", "#health-pill-mobile"].forEach(sel => {
+      const el = $(sel);
+      if (!el) return;
+      el.textContent = text;
+      el.className = "pill " + (ok ? "ok" : "bad") + (sel.includes("mobile") ? " mobile-only" : "");
+    });
   }
 
   function setActiveNav(route) {
     $$(".nav-item").forEach(a => {
       a.classList.toggle("active", a.dataset.route === route);
     });
+    $$(".bottom-nav-item[data-route]").forEach(a => {
+      a.classList.toggle("active", a.dataset.route === route);
+    });
+    // "More" highlights when on secondary pages
+    const more = $("#bottom-more");
+    if (more) {
+      const primary = ["overview", "metrics", "processes", "logs"];
+      more.classList.toggle("active", !primary.includes(route));
+    }
   }
 
   const titles = {
@@ -345,8 +382,11 @@
     $("#page-title").textContent = titles[state.route] || "SMOS";
     setActiveNav(state.route);
     if (state.health) {
-      $("#host-label").textContent = state.health.host_label || "smos-host";
+      const label = state.health.host_label || "smos-host";
+      $("#host-label").textContent = label;
       $("#version").textContent = "v" + (state.health.version || "?");
+      const topHost = $("#topbar-host");
+      if (topHost) topHost.textContent = label;
     }
     if (state.auth?.email) {
       $("#user-email").textContent = state.auth.email;
@@ -406,20 +446,23 @@
         </div>
         <div class="card wide">
           <h3>Host</h3>
-          <table>
-            <tr><th>Hostname</th><td class="mono">${esc(m.hostname)}</td></tr>
-            <tr><th>Label</th><td class="mono">${esc(h?.host_label || "—")}</td></tr>
-            <tr><th>Host uptime</th><td class="mono">${fmtUptime(m.uptime_secs)}</td></tr>
-            <tr><th>SMOS uptime</th><td class="mono">${fmtUptime(h?.uptime_secs)}</td></tr>
-            <tr><th>Processes</th><td class="mono">${state.processes.length}</td></tr>
-          </table>
+          <div class="table-wrap table-wrap-auto">
+            <table>
+              <tr><th>Hostname</th><td class="mono">${esc(m.hostname)}</td></tr>
+              <tr><th>Label</th><td class="mono">${esc(h?.host_label || "—")}</td></tr>
+              <tr><th>Host uptime</th><td class="mono">${fmtUptime(m.uptime_secs)}</td></tr>
+              <tr><th>SMOS uptime</th><td class="mono">${fmtUptime(h?.uptime_secs)}</td></tr>
+              <tr><th>Processes</th><td class="mono">${state.processes.length}</td></tr>
+            </table>
+          </div>
         </div>
         <div class="card">
           <h3>Quick links</h3>
-          <div style="display:grid;gap:0.5rem">
+          <div class="quick-links">
             <a class="btn secondary" href="#/processes">Manage processes</a>
             <a class="btn secondary" href="#/logs">Browse logs</a>
             <a class="btn secondary" href="#/audit">Audit journal</a>
+            <a class="btn secondary" href="#/security">Security & 2FA</a>
           </div>
         </div>
       </div>`;
@@ -436,8 +479,8 @@
       [1, "1h"], [6, "6h"], [24, "24h"], [72, "3d"], [168, "7d"], [720, "30d"],
     ];
     const buttons = opts.map(([h, label]) =>
-      `<button type="button" class="btn ${hours === h ? "" : "secondary"}" data-hist-hours="${h}">${label}</button>`
-    ).join(" ");
+      `<button type="button" class="chip ${hours === h ? "active" : ""}" data-hist-hours="${h}">${label}</button>`
+    ).join("");
     const count = state.metricsHistory?.count ?? 0;
     const ret = state.metricsHistory?.retention_days
       ?? state.config?.history_retention_days
@@ -445,11 +488,10 @@
     return `
       <div class="card full">
         <h3>Stored history</h3>
-        <p class="muted">Samples are written every ${state.config?.metrics_history_interval_secs || 60}s and kept for <strong>${ret} days</strong> (change under Config).</p>
-        <div class="log-toolbar" style="flex-wrap:wrap;gap:0.4rem">${buttons}
-          <span class="muted" style="margin-left:0.5rem">${count} points · range ${hours}h</span>
-        </div>
-        <div class="grid" style="margin-top:1rem">
+        <p class="muted">Samples every ${state.config?.metrics_history_interval_secs || 60}s · kept <strong>${ret} days</strong></p>
+        <div class="chip-row" role="group" aria-label="History range">${buttons}</div>
+        <p class="muted" style="margin-top:0.55rem">${count} points · last ${hours}h</p>
+        <div class="grid" style="margin-top:0.85rem">
           <div class="card">
             <h3>CPU history</h3>
             ${spark(historySeries("cpu").length ? historySeries("cpu") : state.cpuHistory)}
@@ -499,7 +541,9 @@
         </div>
         <div class="card wide">
           <h3>Per-core CPU</h3>
-          <table><thead><tr><th>Core</th><th>Usage</th><th></th></tr></thead><tbody>${cores || '<tr><td colspan="3" class="empty">No core data</td></tr>'}</tbody></table>
+          <div class="table-wrap table-wrap-auto">
+            <table><thead><tr><th>Core</th><th>Usage</th><th></th></tr></thead><tbody>${cores || '<tr><td colspan="3" class="empty">No core data</td></tr>'}</tbody></table>
+          </div>
         </div>
         <div class="card">
           <h3>Load average</h3>
@@ -507,16 +551,19 @@
         </div>
         <div class="card full">
           <h3>Disks</h3>
-          <table>
-            <thead><tr><th>Mount</th><th>FS</th><th>Used</th><th>%</th></tr></thead>
-            <tbody>${disks || '<tr><td colspan="4" class="empty">No disks</td></tr>'}</tbody>
-          </table>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Mount</th><th>FS</th><th>Used</th><th>%</th></tr></thead>
+              <tbody>${disks || '<tr><td colspan="4" class="empty">No disks</td></tr>'}</tbody>
+            </table>
+          </div>
         </div>
       </div>`;
   }
 
   function renderProcesses() {
-    const rows = (state.processes || []).slice(0, 150).map(p => `
+    const list = (state.processes || []).slice(0, 150);
+    const rows = list.map(p => `
       <tr>
         <td class="mono">${p.pid}</td>
         <td>${esc(p.name)}</td>
@@ -530,12 +577,33 @@
       </tr>
       <tr><td></td><td colspan="5" class="mono muted" style="padding-top:0;border:0">${esc((p.cmd || p.exe || "").slice(0, 160))}</td></tr>
     `).join("");
+    const cards = list.map(p => `
+      <article class="proc-card">
+        <div class="proc-card-top">
+          <div>
+            <div class="proc-name">${esc(p.name)}</div>
+            <div class="proc-meta">
+              <span>PID ${p.pid}</span>
+              <span>CPU ${fmtPct(p.cpu_usage)}</span>
+              <span>Mem ${fmtBytes(p.memory_bytes)}</span>
+              <span>${esc(p.status)}</span>
+            </div>
+          </div>
+        </div>
+        <div class="proc-cmd">${esc((p.cmd || p.exe || "—").slice(0, 180))}</div>
+        <div class="row-actions">
+          <button class="btn secondary" data-act="terminate" data-pid="${p.pid}">Terminate</button>
+          <button class="btn danger" data-act="kill" data-pid="${p.pid}">Kill</button>
+        </div>
+      </article>
+    `).join("");
     return `
       <div class="grid">
         <div class="card full">
           <h3>Running processes (${state.processes.length})</h3>
-          <p class="muted">Terminate sends a graceful signal; Kill forces exit. Self-process actions are blocked.</p>
-          <div style="overflow:auto;max-height:70vh">
+          <p class="muted">Terminate is graceful; Kill forces exit. Self-process actions are blocked.</p>
+          <div class="proc-list">${cards || '<div class="empty">No processes</div>'}</div>
+          <div class="table-wrap proc-table-wrap" style="max-height:70vh;overflow:auto">
             <table>
               <thead><tr><th>PID</th><th>Name</th><th>CPU</th><th>Mem</th><th>Status</th><th>Actions</th></tr></thead>
               <tbody>${rows || '<tr><td colspan="6" class="empty">No processes</td></tr>'}</tbody>
@@ -667,10 +735,12 @@
       <div class="grid">
         <div class="card full">
           <h3>Audit journal</h3>
-          <table>
-            <thead><tr><th>Time</th><th>Action</th><th>Target</th><th>Result</th><th>Detail</th></tr></thead>
-            <tbody>${rows || '<tr><td colspan="5" class="empty">No audit entries yet</td></tr>'}</tbody>
-          </table>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Time</th><th>Action</th><th>Target</th><th>Result</th><th>Detail</th></tr></thead>
+              <tbody>${rows || '<tr><td colspan="5" class="empty">No audit entries yet</td></tr>'}</tbody>
+            </table>
+          </div>
         </div>
       </div>`;
   }
@@ -899,6 +969,7 @@
 
   function onRoute() {
     if (state.gate) return;
+    closeNav();
     parseRoute();
     refreshAll();
   }
@@ -918,10 +989,26 @@
     }, Math.max(1, secs) * 1000);
   }
 
-  // boot
-  $("#refresh-btn").addEventListener("click", () => refreshAll());
-  $("#logout-btn").addEventListener("click", () => doLogout());
+  // shell chrome
+  $("#refresh-btn")?.addEventListener("click", () => refreshAll());
+  $("#logout-btn")?.addEventListener("click", () => {
+    closeNav();
+    doLogout();
+  });
+  $("#nav-open")?.addEventListener("click", () => toggleNav());
+  $("#nav-close")?.addEventListener("click", () => closeNav());
+  $("#nav-backdrop")?.addEventListener("click", () => closeNav());
+  $("#bottom-more")?.addEventListener("click", () => openNav());
+  $("#nav")?.addEventListener("click", (ev) => {
+    if (ev.target.closest("a.nav-item")) closeNav();
+  });
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeNav();
+  });
   window.addEventListener("hashchange", onRoute);
+  window.addEventListener("resize", () => {
+    if (window.innerWidth > 900) closeNav();
+  });
 
   (async function init() {
     parseRoute();

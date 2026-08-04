@@ -2,7 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b1220" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="color-scheme" content="dark" />
   <title>SMOS — Server Management OS</title>
   <link rel="stylesheet" href="/assets/style.css" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -14,39 +18,97 @@
   <div id="auth-gate" class="auth-gate hidden" aria-live="polite"></div>
 
   <div id="app" class="hidden">
-    <aside class="sidebar">
-      <div class="brand">
-        <div class="brand-mark">S</div>
-        <div>
-          <div class="brand-title">SMOS</div>
-          <div class="brand-sub" id="host-label">loading…</div>
+    <div id="nav-backdrop" class="nav-backdrop" hidden></div>
+
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+      <div class="sidebar-head">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">S</div>
+          <div class="brand-text">
+            <div class="brand-title">SMOS</div>
+            <div class="brand-sub" id="host-label">loading…</div>
+          </div>
         </div>
+        <button type="button" class="icon-btn sidebar-close" id="nav-close" aria-label="Close menu">
+          <span aria-hidden="true">✕</span>
+        </button>
       </div>
       <nav class="nav" id="nav">
-        <a href="#/overview" data-route="overview" class="nav-item active">Overview</a>
-        <a href="#/metrics" data-route="metrics" class="nav-item">Metrics</a>
-        <a href="#/processes" data-route="processes" class="nav-item">Processes</a>
-        <a href="#/logs" data-route="logs" class="nav-item">Logs</a>
-        <a href="#/config" data-route="config" class="nav-item">Config</a>
-        <a href="#/security" data-route="security" class="nav-item">Security</a>
-        <a href="#/audit" data-route="audit" class="nav-item">Audit</a>
+        <a href="#/overview" data-route="overview" class="nav-item active">
+          <span class="nav-ico" aria-hidden="true">⌂</span><span>Overview</span>
+        </a>
+        <a href="#/metrics" data-route="metrics" class="nav-item">
+          <span class="nav-ico" aria-hidden="true">◉</span><span>Metrics</span>
+        </a>
+        <a href="#/processes" data-route="processes" class="nav-item">
+          <span class="nav-ico" aria-hidden="true">☰</span><span>Processes</span>
+        </a>
+        <a href="#/logs" data-route="logs" class="nav-item">
+          <span class="nav-ico" aria-hidden="true">≡</span><span>Logs</span>
+        </a>
+        <a href="#/config" data-route="config" class="nav-item">
+          <span class="nav-ico" aria-hidden="true">⚙</span><span>Config</span>
+        </a>
+        <a href="#/security" data-route="security" class="nav-item">
+          <span class="nav-ico" aria-hidden="true">◎</span><span>Security</span>
+        </a>
+        <a href="#/audit" data-route="audit" class="nav-item">
+          <span class="nav-ico" aria-hidden="true">⌀</span><span>Audit</span>
+        </a>
       </nav>
       <div class="sidebar-foot">
         <div id="health-pill" class="pill">connecting</div>
-        <div class="muted" id="user-email"></div>
+        <div class="muted truncate" id="user-email"></div>
         <div class="muted" id="version"></div>
-        <button type="button" class="btn secondary" id="logout-btn" style="width:100%;margin-top:0.35rem">Log out</button>
+        <button type="button" class="btn secondary btn-block" id="logout-btn">Log out</button>
       </div>
     </aside>
+
     <main class="main">
       <header class="topbar">
-        <h1 id="page-title">Overview</h1>
+        <div class="topbar-left">
+          <button type="button" class="icon-btn menu-btn" id="nav-open" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
+            <span class="hamburger" aria-hidden="true"></span>
+          </button>
+          <div class="topbar-titles">
+            <h1 id="page-title">Overview</h1>
+            <div class="topbar-sub muted" id="topbar-host"></div>
+          </div>
+        </div>
         <div class="topbar-actions">
-          <button id="refresh-btn" class="btn">Refresh</button>
+          <div id="health-pill-mobile" class="pill mobile-only">…</div>
+          <button id="refresh-btn" class="btn btn-refresh" type="button" aria-label="Refresh">
+            <span class="btn-label">Refresh</span>
+            <span class="btn-ico" aria-hidden="true">↻</span>
+          </button>
         </div>
       </header>
       <section id="view" class="view"></section>
     </main>
+
+    <!-- Primary routes as bottom tabs on phones -->
+    <nav class="bottom-nav" id="bottom-nav" aria-label="Primary">
+      <a href="#/overview" data-route="overview" class="bottom-nav-item active">
+        <span class="bn-ico" aria-hidden="true">⌂</span>
+        <span>Home</span>
+      </a>
+      <a href="#/metrics" data-route="metrics" class="bottom-nav-item">
+        <span class="bn-ico" aria-hidden="true">◉</span>
+        <span>Metrics</span>
+      </a>
+      <a href="#/processes" data-route="processes" class="bottom-nav-item">
+        <span class="bn-ico" aria-hidden="true">☰</span>
+        <span>Procs</span>
+      </a>
+      <a href="#/logs" data-route="logs" class="bottom-nav-item">
+        <span class="bn-ico" aria-hidden="true">≡</span>
+        <span>Logs</span>
+      </a>
+      <button type="button" class="bottom-nav-item" id="bottom-more" aria-label="More pages">
+        <span class="bn-ico" aria-hidden="true">⋯</span>
+        <span>More</span>
+      </button>
+    </nav>
   </div>
   <script src="/assets/app.js"></script>
 </body>
