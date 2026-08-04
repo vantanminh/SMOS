@@ -7,9 +7,10 @@ Rust service for VPS host management: **metrics**, **processes**, **logs**, **co
 | Area | Capability |
 | --- | --- |
 | Auth | First-run **onboarding** (email + password); session login; optional **offline TOTP 2FA** |
-| Performance | Live CPU, memory, disk (and load average on Unix) via `sysinfo` |
+| Performance | Live CPU, memory, disk, **network interfaces** (and load average on Unix) via `sysinfo` |
 | History | Persist metrics samples + daily service logs; **default 30-day retention** (configurable) |
-| Processes | List running processes; terminate / kill (self-process blocked) |
+| Processes | List / **filter by name or PID** / **sort by CPU, memory, name, PID**; terminate / kill (self-process blocked) |
+| Alerts | Configurable **CPU / memory / disk** usage thresholds (default 90%); live breach status on overview |
 | Logs | Tail SMOS service log, daily history files, + allowlisted extra paths |
 | Config | Read/update validated config; persisted to `config.json` |
 | Audit | Append-only JSONL journal for mutating actions |
@@ -226,10 +227,11 @@ sudo chown -R smos:smos /var/lib/smos
 | POST | `/api/auth/totp/setup` | Begin offline TOTP enrollment |
 | POST | `/api/auth/totp/enable` | `{code}` enable 2FA |
 | POST | `/api/auth/totp/disable` | `{password,code}` disable 2FA |
-| GET | `/api/metrics` | Live host metrics snapshot |
+| GET | `/api/metrics` | Live host metrics snapshot (CPU, memory, disks, **networks**) |
 | GET | `/api/metrics/history?hours=N&limit=M` | Stored metrics samples (default last 24h) |
 | GET | `/api/history` | History storage status (sizes, counts, log files) |
-| GET | `/api/processes` | Process list |
+| GET | `/api/alerts` | Live threshold breach status vs configured CPU/memory/disk percents |
+| GET | `/api/processes` | Process list (optional query filters — see below) |
 | POST | `/api/processes/{pid}/action` | Body: `{"action":"terminate"\|"kill"}` |
 | GET | `/api/logs` | Log sources (live + daily history files) |
 | GET | `/api/logs/{source_id}?lines=N` | Tail log source (`smos-service` or `history:smos.log.YYYY-MM-DD`) |
@@ -238,6 +240,18 @@ sudo chown -R smos:smos /var/lib/smos
 | GET | `/api/audit?limit=N` | Audit journal (newest first) |
 | GET | `/` | WebUI dashboard |
 
+### Process query params
+
+`GET /api/processes` accepts:
+
+| Param | Meaning |
+| --- | --- |
+| `name` | Case-insensitive substring match on process name, cmd, or exe |
+| `pid` | Exact PID |
+| `sort` | `cpu` (default), `memory`, `name`, or `pid` |
+| `order` | `asc` or `desc` (default desc for cpu/memory, asc for name/pid) |
+| `limit` | Max rows after filter/sort |
+
 ### History retention
 
 | Config field | Default | Meaning |
@@ -245,13 +259,25 @@ sudo chown -R smos:smos /var/lib/smos
 | `history_retention_days` | **30** | Keep metrics samples and rotated daily logs for this many days (1–3650) |
 | `metrics_history_interval_secs` | **60** | How often the service appends a metrics sample to disk (10–3600) |
 
-Change either field in the **Config** page or via `PUT /api/config`. Prune runs on startup and about once per hour.
+### Alert thresholds
+
+| Config field | Default | Meaning |
+| --- | --- | --- |
+| `alert_cpu_percent` | **90** | Breach when global CPU usage % ≥ this value (0–100) |
+| `alert_memory_percent` | **90** | Breach when memory usage % ≥ this value |
+| `alert_disk_percent` | **90** | Breach when any disk usage % ≥ this value |
+
+`GET /api/alerts` returns current values, per-metric `breached` flags, and `any_breached`. Change thresholds in the **Config** page or via `PUT /api/config`.
+
+Change history or alert fields in the **Config** page or via `PUT /api/config`. Prune runs on startup and about once per hour.
 
 ### Example
 
 ```bash
 curl -s http://127.0.0.1:9090/api/health | jq
-curl -s http://127.0.0.1:9090/api/metrics | jq '.cpu,.memory.usage_percent'
+curl -s http://127.0.0.1:9090/api/metrics | jq '.cpu,.memory.usage_percent,.networks[:3]'
+curl -s 'http://127.0.0.1:9090/api/processes?name=smos&sort=cpu&order=desc' | jq '.[0:5]'
+curl -s http://127.0.0.1:9090/api/alerts | jq
 curl -s 'http://127.0.0.1:9090/api/metrics/history?hours=24&limit=200' | jq '.count, .retention_days'
 curl -s http://127.0.0.1:9090/api/history | jq
 curl -s -X PUT http://127.0.0.1:9090/api/config \
