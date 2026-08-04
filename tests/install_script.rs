@@ -87,6 +87,23 @@ fn install_script_automates_place_and_service() {
 }
 
 #[test]
+fn install_script_waits_for_apt_dpkg_lock() {
+    let body = read_install_script();
+    assert!(
+        body.contains("wait_for_apt_lock") || body.contains("apt_is_locked"),
+        "install.sh must wait when dpkg/apt is locked (unattended-upgrades)"
+    );
+    assert!(
+        body.contains("lock-frontend") || body.contains("unattended-upgr"),
+        "install.sh should mention dpkg lock-frontend / unattended-upgrades"
+    );
+    assert!(
+        body.contains("apt_get_retry") || body.contains("Could not get lock"),
+        "install.sh should retry apt-get on lock errors"
+    );
+}
+
+#[test]
 fn install_script_upgrades_without_text_file_busy() {
     let body = read_install_script();
     // Must stop running service and/or replace binary via rename (not in-place cp).

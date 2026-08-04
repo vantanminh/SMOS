@@ -14,6 +14,7 @@
 #   SMOS_FROM_SOURCE=1           fallback: clone + cargo build (slow; needs rustc)
 #   SMOS_ASSET_URL=              override direct tarball URL
 #   SMOS_USER=smos
+#   SMOS_APT_WAIT_SECS=600       how long to wait for dpkg/apt locks (unattended-upgrades)
 
 set -euo pipefail
 
@@ -29,6 +30,7 @@ SMOS_ASSET_URL="${SMOS_ASSET_URL:-}"
 SMOS_USER="${SMOS_USER:-smos}"
 SMOS_GITHUB_API="${SMOS_GITHUB_API:-https://api.github.com}"
 SMOS_GITHUB_RAW="${SMOS_GITHUB_RAW:-https://github.com}"
+SMOS_APT_WAIT_SECS="${SMOS_APT_WAIT_SECS:-600}"
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -67,15 +69,105 @@ detect_target() {
   log "detected target ${SMOS_TARGET}"
 }
 
+# True when another process holds apt/dpkg locks (e.g. unattended-upgrades).
+apt_is_locked() {
+  local locks=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/lib/apt/lists/lock
+    /var/cache/apt/archives/lock
+  )
+  if command -v fuser >/dev/null 2>&1; then
+    local lock
+    for lock in "${locks[@]}"; do
+      if [ -e "$lock" ] && fuser "$lock" >/dev/null 2>&1; then
+        return 0
+      fi
+    done
+  fi
+  # fuser may be missing; fall back to process names.
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -x unattended-upgr >/dev/null 2>&1 && return 0
+    pgrep -x apt-get >/dev/null 2>&1 && return 0
+    pgrep -x apt >/dev/null 2>&1 && return 0
+    pgrep -x dpkg >/dev/null 2>&1 && return 0
+    pgrep -x packagekitd >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# Wait until apt/dpkg is free so install does not fail with "Could not get lock".
+wait_for_apt_lock() {
+  local timeout="${SMOS_APT_WAIT_SECS}"
+  local start now elapsed
+  start="$(date +%s)"
+  if ! apt_is_locked; then
+    return 0
+  fi
+  log "apt/dpkg is busy (often unattended-upgrades). waiting up to ${timeout}s…"
+  while apt_is_locked; do
+    now="$(date +%s)"
+    elapsed=$((now - start))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      die "timed out after ${timeout}s waiting for apt/dpkg lock.
+  Another process holds /var/lib/dpkg/lock-frontend (often unattended-upgr).
+  Options:
+    • wait a few minutes and re-run this installer
+    • sudo systemctl stop unattended-upgrades   # then re-run; start it again after
+    • SMOS_SKIP_DEPS=1 if curl and tar are already installed"
+    fi
+    if [ $((elapsed % 30)) -lt 5 ]; then
+      log "still waiting for apt lock… (${elapsed}s / ${timeout}s)"
+    fi
+    sleep 5
+  done
+  log "apt/dpkg lock released"
+}
+
+# Run apt-get with lock wait + retries (handles race where lock reappears).
+apt_get_retry() {
+  local attempt=1
+  local max_attempts=12
+  local out rc
+  while [ "$attempt" -le "$max_attempts" ]; do
+    wait_for_apt_lock
+    set +e
+    out="$(DEBIAN_FRONTEND=noninteractive run_as_root apt-get "$@" 2>&1)"
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    if printf '%s' "$out" | grep -Eqi 'Could not get lock|Unable to acquire the dpkg frontend lock|is another process using it'; then
+      log "apt-get still locked (attempt ${attempt}/${max_attempts}); retrying in 10s…"
+      sleep 10
+      attempt=$((attempt + 1))
+      continue
+    fi
+    printf '%s\n' "$out" >&2
+    return "$rc"
+  done
+  printf '%s\n' "$out" >&2
+  die "apt-get failed: could not acquire dpkg lock after ${max_attempts} attempts"
+}
+
 install_runtime_deps() {
   if [ "$SMOS_SKIP_DEPS" = "1" ]; then
     log "skipping runtime deps (SMOS_SKIP_DEPS=1)"
+    need_cmd curl
+    need_cmd tar
+    return 0
+  fi
+  # Already present → skip package manager (avoids lock fights on first boot).
+  if command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+    log "curl and tar already installed; skipping package install"
     return 0
   fi
   if command -v apt-get >/dev/null 2>&1; then
     log "installing runtime packages (curl ca-certificates tar)"
-    run_as_root apt-get update -y
-    DEBIAN_FRONTEND=noninteractive run_as_root apt-get install -y curl ca-certificates tar gzip
+    apt_get_retry update -y
+    apt_get_retry install -y curl ca-certificates tar gzip
   elif command -v dnf >/dev/null 2>&1; then
     run_as_root dnf install -y curl ca-certificates tar gzip
   elif command -v yum >/dev/null 2>&1; then
