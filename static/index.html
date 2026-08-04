@@ -10,7 +10,10 @@
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
 </head>
 <body>
-  <div id="app">
+  <!-- Full-screen gate: onboarding / login / TOTP -->
+  <div id="auth-gate" class="auth-gate hidden" aria-live="polite"></div>
+
+  <div id="app" class="hidden">
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark">S</div>
@@ -25,21 +28,20 @@
         <a href="#/processes" data-route="processes" class="nav-item">Processes</a>
         <a href="#/logs" data-route="logs" class="nav-item">Logs</a>
         <a href="#/config" data-route="config" class="nav-item">Config</a>
+        <a href="#/security" data-route="security" class="nav-item">Security</a>
         <a href="#/audit" data-route="audit" class="nav-item">Audit</a>
       </nav>
       <div class="sidebar-foot">
         <div id="health-pill" class="pill">connecting</div>
+        <div class="muted" id="user-email"></div>
         <div class="muted" id="version"></div>
+        <button type="button" class="btn secondary" id="logout-btn" style="width:100%;margin-top:0.35rem">Log out</button>
       </div>
     </aside>
     <main class="main">
       <header class="topbar">
         <h1 id="page-title">Overview</h1>
         <div class="topbar-actions">
-          <label class="token-field">
-            <span>Token</span>
-            <input id="auth-token" type="password" placeholder="optional API token" autocomplete="off" />
-          </label>
           <button id="refresh-btn" class="btn">Refresh</button>
         </div>
       </header>

@@ -6,6 +6,7 @@
   const state = {
     route: "overview",
     health: null,
+    auth: null,
     metrics: null,
     metricsHistory: null,
     historyRangeHours: 24,
@@ -19,15 +20,20 @@
     memHistory: [],
     pollTimer: null,
     error: null,
+    // Auth gate phase: null | "setup" | "login" | "totp" | "totp_enroll"
+    gate: null,
+    pendingToken: null,
+    pendingEmail: null,
+    totpEnroll: null,
   };
 
-  function token() {
-    return localStorage.getItem("smos_token") || $("#auth-token")?.value || "";
+  function sessionToken() {
+    return localStorage.getItem("smos_session") || "";
   }
 
-  function saveToken(v) {
-    if (v) localStorage.setItem("smos_token", v);
-    else localStorage.removeItem("smos_token");
+  function saveSession(v) {
+    if (v) localStorage.setItem("smos_session", v);
+    else localStorage.removeItem("smos_session");
   }
 
   async function api(path, opts = {}) {
@@ -35,17 +41,239 @@
     if (opts.body && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
-    const t = token();
-    if (t) headers["X-SMOS-Token"] = t;
+    const t = sessionToken();
+    if (t) {
+      headers["X-SMOS-Session"] = t;
+      headers["Authorization"] = "Bearer " + t;
+    }
     const res = await fetch("/api" + path, { ...opts, headers });
     const text = await res.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+    if (res.status === 401 || res.status === 403) {
+      const msg = (data && data.error) || res.statusText || "unauthorized";
+      const err = new Error(msg);
+      err.status = res.status;
+      err.setupRequired = res.status === 403;
+      throw err;
+    }
     if (!res.ok) {
       const msg = (data && data.error) || res.statusText || "request failed";
       throw new Error(msg);
     }
     return data;
+  }
+
+  function showApp(show) {
+    $("#app").classList.toggle("hidden", !show);
+    $("#auth-gate").classList.toggle("hidden", show);
+  }
+
+  function renderGate() {
+    const gate = $("#auth-gate");
+    showApp(false);
+    if (state.gate === "setup") {
+      gate.innerHTML = `
+        <div class="auth-card wide">
+          <div class="auth-steps"><span class="on">1 · Account</span><span>2 · Optional 2FA</span><span>3 · Dashboard</span></div>
+          <h1>Welcome to SMOS</h1>
+          <p class="lead">First-time setup. Create the operator account for this host. You will use this email and password to sign in.</p>
+          <form id="setup-form">
+            <label>Email<input name="email" type="email" required autocomplete="username" placeholder="admin@example.com" /></label>
+            <label>Password<input name="password" type="password" required minlength="8" autocomplete="new-password" placeholder="min. 8 characters" /></label>
+            <label>Confirm password<input name="password2" type="password" required minlength="8" autocomplete="new-password" /></label>
+            <label class="check">
+              <input name="enable_totp" type="checkbox" />
+              <span>Also set up offline OTP 2FA (authenticator app — codes work without Wi‑Fi after setup)</span>
+            </label>
+            <button class="btn" type="submit">Create account</button>
+            <div id="gate-msg"></div>
+          </form>
+        </div>`;
+      $("#setup-form").addEventListener("submit", onSetupSubmit);
+      return;
+    }
+    if (state.gate === "totp_enroll") {
+      const t = state.totpEnroll || {};
+      gate.innerHTML = `
+        <div class="auth-card wide">
+          <div class="auth-steps"><span>1 · Account</span><span class="on">2 · Offline 2FA</span><span>3 · Dashboard</span></div>
+          <h1>Enable authenticator (TOTP)</h1>
+          <p class="lead">${esc(t.note || "Add this secret to Google Authenticator, Aegis, or Authy. Codes are generated offline — no Wi‑Fi needed.")}</p>
+          <p class="muted">Account: <span class="mono">${esc(t.account || "")}</span></p>
+          <p class="muted">Secret (manual entry)</p>
+          <div class="secret-box">${esc(t.secret || "")}</div>
+          <p class="muted" style="margin-top:0.75rem">otpauth URI</p>
+          <div class="secret-box" style="font-size:0.75rem">${esc(t.otpauth_url || "")}</div>
+          <form id="enroll-form" style="margin-top:1rem">
+            <label>Enter 6-digit code from your app to confirm
+              <input class="otp-input" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code" />
+            </label>
+            <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
+              <button class="btn" type="submit">Verify & enable 2FA</button>
+              <button class="btn secondary" type="button" id="skip-totp">Skip for now</button>
+            </div>
+            <div id="gate-msg"></div>
+          </form>
+        </div>`;
+      $("#enroll-form").addEventListener("submit", onEnrollSubmit);
+      $("#skip-totp").addEventListener("click", () => enterDashboard());
+      return;
+    }
+    if (state.gate === "totp") {
+      gate.innerHTML = `
+        <div class="auth-card">
+          <h1>Two-factor code</h1>
+          <p class="lead">Enter the 6-digit code from your authenticator app. Works offline — no Wi‑Fi required.</p>
+          <p class="muted">${esc(state.pendingEmail || "")}</p>
+          <form id="totp-form">
+            <label>OTP code
+              <input class="otp-input" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required autocomplete="one-time-code" />
+            </label>
+            <button class="btn" type="submit">Verify</button>
+            <button class="btn secondary" type="button" id="back-login">Back</button>
+            <div id="gate-msg"></div>
+          </form>
+        </div>`;
+      $("#totp-form").addEventListener("submit", onTotpSubmit);
+      $("#back-login").addEventListener("click", () => {
+        state.gate = "login";
+        state.pendingToken = null;
+        renderGate();
+      });
+      return;
+    }
+    // login
+    gate.innerHTML = `
+      <div class="auth-card">
+        <h1>Sign in to SMOS</h1>
+        <p class="lead">Use the operator email and password created during onboarding.</p>
+        <form id="login-form">
+          <label>Email<input name="email" type="email" required autocomplete="username" /></label>
+          <label>Password<input name="password" type="password" required autocomplete="current-password" /></label>
+          <button class="btn" type="submit">Sign in</button>
+          <div id="gate-msg"></div>
+        </form>
+      </div>`;
+    $("#login-form").addEventListener("submit", onLoginSubmit);
+  }
+
+  async function onSetupSubmit(ev) {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const msg = $("#gate-msg");
+    if (fd.get("password") !== fd.get("password2")) {
+      msg.className = "msg err";
+      msg.textContent = "Passwords do not match.";
+      return;
+    }
+    try {
+      const body = {
+        email: fd.get("email"),
+        password: fd.get("password"),
+        enable_totp: !!fd.get("enable_totp"),
+      };
+      const res = await api("/auth/setup", { method: "POST", body: JSON.stringify(body) });
+      if (res.token) saveSession(res.token);
+      if (res.totp) {
+        state.totpEnroll = res.totp;
+        state.gate = "totp_enroll";
+        renderGate();
+        return;
+      }
+      await enterDashboard();
+    } catch (e) {
+      msg.className = "msg err";
+      msg.textContent = e.message;
+    }
+  }
+
+  async function onLoginSubmit(ev) {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const msg = $("#gate-msg");
+    try {
+      const res = await api("/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email: fd.get("email"), password: fd.get("password") }),
+      });
+      if (res.totp_required) {
+        state.pendingToken = res.pending_token;
+        state.pendingEmail = res.email || fd.get("email");
+        state.gate = "totp";
+        renderGate();
+        return;
+      }
+      if (res.token) saveSession(res.token);
+      await enterDashboard();
+    } catch (e) {
+      msg.className = "msg err";
+      msg.textContent = e.message;
+    }
+  }
+
+  async function onTotpSubmit(ev) {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const msg = $("#gate-msg");
+    try {
+      const res = await api("/auth/login/totp", {
+        method: "POST",
+        body: JSON.stringify({ pending_token: state.pendingToken, code: fd.get("code") }),
+      });
+      if (res.token) saveSession(res.token);
+      state.pendingToken = null;
+      await enterDashboard();
+    } catch (e) {
+      msg.className = "msg err";
+      msg.textContent = e.message;
+    }
+  }
+
+  async function onEnrollSubmit(ev) {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const msg = $("#gate-msg");
+    try {
+      await api("/auth/totp/enable", {
+        method: "POST",
+        body: JSON.stringify({ code: fd.get("code") }),
+      });
+      state.totpEnroll = null;
+      await enterDashboard();
+    } catch (e) {
+      msg.className = "msg err";
+      msg.textContent = e.message;
+    }
+  }
+
+  async function enterDashboard() {
+    state.gate = null;
+    showApp(true);
+    parseRoute();
+    try {
+      await loadHealth();
+      await loadAuthStatus();
+      await loadMetrics();
+      await loadProcesses();
+      await loadConfig();
+      startPoll();
+      if (state.route === "logs") await loadLogs();
+      if (state.route === "audit") await loadAudit();
+      if (state.route === "security") await loadAuthStatus();
+      render();
+    } catch (e) {
+      setHealthPill(false, "offline");
+      $("#view").innerHTML = `<div class="msg err">Failed to load dashboard: ${esc(e.message)}</div>`;
+    }
+  }
+
+  async function doLogout() {
+    try { await api("/auth/logout", { method: "POST", body: "{}" }); } catch { /* ignore */ }
+    saveSession("");
+    state.gate = "login";
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    renderGate();
   }
 
   function fmtBytes(n) {
@@ -104,10 +332,15 @@
     processes: "Processes",
     logs: "Logs",
     config: "Configuration",
+    security: "Security",
     audit: "Audit Journal",
   };
 
   function render() {
+    if (state.gate) {
+      renderGate();
+      return;
+    }
     const view = $("#view");
     $("#page-title").textContent = titles[state.route] || "SMOS";
     setActiveNav(state.route);
@@ -115,12 +348,16 @@
       $("#host-label").textContent = state.health.host_label || "smos-host";
       $("#version").textContent = "v" + (state.health.version || "?");
     }
+    if (state.auth?.email) {
+      $("#user-email").textContent = state.auth.email;
+    }
     try {
       switch (state.route) {
         case "metrics": view.innerHTML = renderMetrics(); break;
         case "processes": view.innerHTML = renderProcesses(); break;
         case "logs": view.innerHTML = renderLogs(); break;
         case "config": view.innerHTML = renderConfig(); break;
+        case "security": view.innerHTML = renderSecurity(); break;
         case "audit": view.innerHTML = renderAudit(); break;
         default: view.innerHTML = renderOverview();
       }
@@ -374,6 +611,48 @@
       </div>`;
   }
 
+  function renderSecurity() {
+    const a = state.auth || {};
+    const totpOn = !!a.totp_enabled;
+    return `
+      <div class="grid">
+        <div class="card wide">
+          <h3>Operator account</h3>
+          <table>
+            <tr><th>Email</th><td class="mono">${esc(a.email || "—")}</td></tr>
+            <tr><th>Session</th><td class="mono">${a.authenticated ? "active" : "none"}</td></tr>
+            <tr><th>Offline 2FA (TOTP)</th><td class="mono">${totpOn ? "enabled" : "disabled"}</td></tr>
+          </table>
+          <p class="muted" style="margin-top:0.75rem">TOTP codes are generated on your phone offline (RFC 6238). No SMS or network is required after the secret is stored in your authenticator app.</p>
+        </div>
+        <div class="card">
+          <h3>Two-factor authentication</h3>
+          ${totpOn ? `
+            <p class="muted">2FA is on. Disable requires password + current OTP.</p>
+            <form id="totp-disable-form" class="form-grid" style="grid-template-columns:1fr">
+              <label>Password<input name="password" type="password" required autocomplete="current-password" /></label>
+              <label>Current OTP<input name="code" class="otp-input" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required /></label>
+              <div class="form-actions"><button class="btn danger" type="submit">Disable 2FA</button></div>
+            </form>
+          ` : `
+            <p class="muted">Optional offline OTP. Use Google Authenticator, Aegis, Authy, etc.</p>
+            <button class="btn" id="totp-begin">Set up authenticator</button>
+          `}
+          <div id="security-msg" style="margin-top:0.75rem"></div>
+        </div>
+        ${state.totpEnroll ? `
+        <div class="card full">
+          <h3>Confirm enrollment</h3>
+          <p class="muted">${esc(state.totpEnroll.note || "")}</p>
+          <div class="secret-box">${esc(state.totpEnroll.secret || "")}</div>
+          <form id="totp-enable-form" style="margin-top:0.75rem;display:grid;gap:0.75rem;max-width:320px">
+            <label>6-digit code<input name="code" class="otp-input" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required /></label>
+            <button class="btn" type="submit">Verify & enable</button>
+          </form>
+        </div>` : ""}
+      </div>`;
+  }
+
   function renderAudit() {
     const rows = (state.audit || []).map(e => `
       <tr>
@@ -471,11 +750,72 @@
         }
       });
     }
+
+    const totpBegin = $("#totp-begin");
+    if (totpBegin) {
+      totpBegin.addEventListener("click", async () => {
+        const msg = $("#security-msg");
+        try {
+          state.totpEnroll = await api("/auth/totp/setup", { method: "POST", body: "{}" });
+          render();
+        } catch (e) {
+          msg.className = "msg err";
+          msg.textContent = e.message;
+        }
+      });
+    }
+    const totpEnable = $("#totp-enable-form");
+    if (totpEnable) {
+      totpEnable.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const fd = new FormData(totpEnable);
+        const msg = $("#security-msg");
+        try {
+          await api("/auth/totp/enable", {
+            method: "POST",
+            body: JSON.stringify({ code: fd.get("code") }),
+          });
+          state.totpEnroll = null;
+          await loadAuthStatus();
+          msg.className = "msg ok";
+          msg.textContent = "Offline 2FA enabled.";
+          render();
+        } catch (e) {
+          msg.className = "msg err";
+          msg.textContent = e.message;
+        }
+      });
+    }
+    const totpDisable = $("#totp-disable-form");
+    if (totpDisable) {
+      totpDisable.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const fd = new FormData(totpDisable);
+        const msg = $("#security-msg");
+        try {
+          await api("/auth/totp/disable", {
+            method: "POST",
+            body: JSON.stringify({ password: fd.get("password"), code: fd.get("code") }),
+          });
+          await loadAuthStatus();
+          msg.className = "msg ok";
+          msg.textContent = "2FA disabled.";
+          render();
+        } catch (e) {
+          msg.className = "msg err";
+          msg.textContent = e.message;
+        }
+      });
+    }
   }
 
   async function loadHealth() {
     state.health = await api("/health");
     setHealthPill(true, "online");
+  }
+
+  async function loadAuthStatus() {
+    state.auth = await api("/auth/status");
   }
 
   async function loadMetrics() {
@@ -519,8 +859,10 @@
   }
 
   async function refreshAll() {
+    if (state.gate) return;
     try {
       await loadHealth();
+      await loadAuthStatus();
       await loadMetrics();
       if (state.route === "processes" || state.route === "overview") await loadProcesses();
       if (state.route === "metrics" || state.route === "overview") {
@@ -528,9 +870,21 @@
       }
       if (state.route === "logs") await loadLogs();
       if (state.route === "config") await loadConfig();
+      if (state.route === "security") await loadAuthStatus();
       if (state.route === "audit") await loadAudit();
       render();
     } catch (e) {
+      if (e.status === 401) {
+        saveSession("");
+        state.gate = "login";
+        renderGate();
+        return;
+      }
+      if (e.status === 403) {
+        state.gate = "setup";
+        renderGate();
+        return;
+      }
       setHealthPill(false, "offline");
       state.error = e.message;
       $("#view").innerHTML = `<div class="msg err">API error: ${esc(e.message)}</div>`;
@@ -544,6 +898,7 @@
   }
 
   function onRoute() {
+    if (state.gate) return;
     parseRoute();
     refreshAll();
   }
@@ -552,7 +907,7 @@
     if (state.pollTimer) clearInterval(state.pollTimer);
     const secs = state.config?.metrics_poll_secs || 2;
     state.pollTimer = setInterval(async () => {
-      if (document.hidden) return;
+      if (document.hidden || state.gate) return;
       try {
         await loadMetrics();
         if (state.route === "overview" || state.route === "metrics") render();
@@ -564,27 +919,41 @@
   }
 
   // boot
-  const tokenInput = $("#auth-token");
-  tokenInput.value = localStorage.getItem("smos_token") || "";
-  tokenInput.addEventListener("change", () => saveToken(tokenInput.value.trim()));
   $("#refresh-btn").addEventListener("click", () => refreshAll());
+  $("#logout-btn").addEventListener("click", () => doLogout());
   window.addEventListener("hashchange", onRoute);
 
   (async function init() {
     parseRoute();
     try {
-      await loadHealth();
-      await loadMetrics();
-      await loadProcesses();
-      await loadConfig();
-      startPoll();
-      // preload route-specific
-      if (state.route === "logs") await loadLogs();
-      if (state.route === "audit") await loadAudit();
-      render();
+      const status = await api("/auth/status");
+      state.auth = status;
+      if (status.setup_required) {
+        state.gate = "setup";
+        renderGate();
+        return;
+      }
+      if (!status.authenticated) {
+        // Have a stored session that may still be valid?
+        if (sessionToken()) {
+          try {
+            const me = await api("/auth/me");
+            if (me.authenticated) {
+              await enterDashboard();
+              return;
+            }
+          } catch {
+            saveSession("");
+          }
+        }
+        state.gate = "login";
+        renderGate();
+        return;
+      }
+      await enterDashboard();
     } catch (e) {
-      setHealthPill(false, "offline");
-      $("#view").innerHTML = `<div class="msg err">Failed to connect to SMOS API: ${esc(e.message)}</div>`;
+      $("#auth-gate").classList.remove("hidden");
+      $("#auth-gate").innerHTML = `<div class="auth-card"><h1>SMOS</h1><p class="msg err">Cannot reach API: ${esc(e.message)}</p></div>`;
     }
   })();
 })();

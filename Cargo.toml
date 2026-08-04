@@ -25,6 +25,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 mime_guess = "2"
 parking_lot = "0.12"
 bytes = "1"
+argon2 = "0.5.3"
+totp-rs = { version = "5.7.2", features = ["otpauth", "gen_secret"] }
+data-encoding = "2.11.1"
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

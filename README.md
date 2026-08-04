@@ -6,13 +6,14 @@ Rust service for VPS host management: **metrics**, **processes**, **logs**, **co
 
 | Area | Capability |
 | --- | --- |
+| Auth | First-run **onboarding** (email + password); session login; optional **offline TOTP 2FA** |
 | Performance | Live CPU, memory, disk (and load average on Unix) via `sysinfo` |
 | History | Persist metrics samples + daily service logs; **default 30-day retention** (configurable) |
 | Processes | List running processes; terminate / kill (self-process blocked) |
 | Logs | Tail SMOS service log, daily history files, + allowlisted extra paths |
 | Config | Read/update validated config; persisted to `config.json` |
 | Audit | Append-only JSONL journal for mutating actions |
-| WebUI | Hash-routed SPA (`#/overview`, `#/metrics`, `#/processes`, `#/logs`, `#/config`, `#/audit`) |
+| WebUI | Hash-routed SPA (onboarding/login gate + dashboard routes) |
 
 ## Quick start
 
@@ -45,11 +46,14 @@ Open the dashboard: **http://127.0.0.1:9090/** (or your bind address).
 
 ### Auth posture
 
-- **GET** routes are open (health, metrics, process list, logs, config view, audit).
-- When `--auth-token` / `SMOS_AUTH_TOKEN` is set, **PUT/POST** require either:
-  - `Authorization: Bearer <token>`, or
-  - `X-SMOS-Token: <token>`
-- Default bind is **localhost**. For a public VPS, use a firewall, reverse proxy TLS, and set an auth token. Process kill without auth on `0.0.0.0` is unsafe.
+1. **First visit:** WebUI forces **onboarding** — set operator **email + password** (min 8 chars). Optionally enroll **TOTP** (authenticator app; codes work **offline**, no Wi‑Fi).
+2. **Later visits:** **login** page; if TOTP is enabled, enter the 6-digit OTP after password.
+3. After setup, almost all `/api/*` routes require a **session** header:
+   - `Authorization: Bearer <session>`, or
+   - `X-SMOS-Session: <session>`
+4. Optional machine token `--auth-token` / `SMOS_AUTH_TOKEN` still works for automation (same headers as above).
+5. Public without session: `/api/health`, `/api/auth/status`, setup/login/logout endpoints, and static UI.
+6. Default bind is **localhost**. On a public VPS, use TLS (reverse proxy) and keep 2FA enabled.
 
 ## Install (one command)
 
@@ -212,7 +216,16 @@ sudo chown -R smos:smos /var/lib/smos
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/health` | Liveness + version + host label |
+| GET | `/api/health` | Liveness + version + setup/auth flags |
+| GET | `/api/auth/status` | setup_required / authenticated / totp_enabled |
+| POST | `/api/auth/setup` | First-time onboarding `{email,password,enable_totp?}` |
+| POST | `/api/auth/login` | `{email,password}` → session or `totp_required` |
+| POST | `/api/auth/login/totp` | `{pending_token,code}` complete 2FA login |
+| POST | `/api/auth/logout` | Invalidate session |
+| GET | `/api/auth/me` | Current session |
+| POST | `/api/auth/totp/setup` | Begin offline TOTP enrollment |
+| POST | `/api/auth/totp/enable` | `{code}` enable 2FA |
+| POST | `/api/auth/totp/disable` | `{password,code}` disable 2FA |
 | GET | `/api/metrics` | Live host metrics snapshot |
 | GET | `/api/metrics/history?hours=N&limit=M` | Stored metrics samples (default last 24h) |
 | GET | `/api/history` | History storage status (sizes, counts, log files) |
@@ -252,6 +265,7 @@ curl -s http://127.0.0.1:9090/api/audit?limit=5 | jq
 ```
 smos-data/                    # or --data-dir
   config.json                 # persisted configuration
+  auth.json                   # operator account (argon2 hash + optional TOTP secret)
   audit.jsonl                 # append-only audit journal
   smos.log.YYYY-MM-DD         # daily rotated service logs (browsable in UI)
   history/

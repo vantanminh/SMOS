@@ -1,6 +1,7 @@
 //! HTTP API routes for SMOS.
 
 use crate::audit::AuditEntry;
+use crate::auth::{AuthStatus, LoginResponse, TotpSetupResponse};
 use crate::config::{ConfigUpdate, PublicConfig, SmosConfig};
 use crate::history::{self, HistoryStatus, MetricsHistoryResponse};
 use crate::logs::{self, LogSourceInfo, LogTail, SERVICE_LOG_ID};
@@ -36,6 +37,52 @@ struct HealthResponse {
     host_label: String,
     started_at: chrono::DateTime<chrono::Utc>,
     uptime_secs: i64,
+    setup_required: bool,
+    authenticated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupRequest {
+    email: String,
+    password: String,
+    /// When true, generate offline TOTP enrollment material (not enforced until verified).
+    #[serde(default)]
+    enable_totp: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SetupResponse {
+    #[serde(flatten)]
+    login: LoginResponse,
+    totp: Option<TotpSetupResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TotpLoginRequest {
+    pending_token: String,
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TotpCodeRequest {
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TotpDisableRequest {
+    password: String,
+    code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OkResponse {
+    ok: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +110,15 @@ pub struct MetricsHistoryQuery {
 pub fn router(state: AppState, static_dir: PathBuf) -> Router {
     let api = Router::new()
         .route("/health", get(health))
+        .route("/auth/status", get(auth_status))
+        .route("/auth/setup", post(auth_setup))
+        .route("/auth/login", post(auth_login))
+        .route("/auth/login/totp", post(auth_login_totp))
+        .route("/auth/logout", post(auth_logout))
+        .route("/auth/me", get(auth_me))
+        .route("/auth/totp/setup", post(auth_totp_setup))
+        .route("/auth/totp/enable", post(auth_totp_enable))
+        .route("/auth/totp/disable", post(auth_totp_disable))
         .route("/metrics", get(get_metrics))
         .route("/metrics/history", get(get_metrics_history))
         .route("/history", get(get_history_status))
@@ -135,6 +191,20 @@ async fn index_html(State(state): State<AppState>) -> impl IntoResponse {
     Html(include_str!("../static/index.html")).into_response()
 }
 
+/// Paths that stay public (no session) under `/api`.
+fn is_public_api(method: &axum::http::Method, path: &str) -> bool {
+    // path is relative to the nested /api router, e.g. "/health"
+    match (method.as_str(), path) {
+        ("GET" | "HEAD", "/health") => true,
+        ("GET" | "HEAD", "/auth/status") => true,
+        ("POST", "/auth/setup") => true,
+        ("POST", "/auth/login") => true,
+        ("POST", "/auth/login/totp") => true,
+        ("POST", "/auth/logout") => true,
+        _ => false,
+    }
+}
+
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request,
@@ -143,20 +213,32 @@ async fn auth_middleware(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    // Read-only routes are open; mutating routes require token when configured.
-    let is_mutating = method != axum::http::Method::GET && method != axum::http::Method::HEAD;
-    if !is_mutating {
+    if is_public_api(&method, &path) {
         return Ok(next.run(req).await);
     }
 
-    let Some(expected) = state.auth_token() else {
-        return Ok(next.run(req).await);
-    };
+    let setup_required = state.inner.auth.setup_required();
+    if setup_required {
+        // Force onboarding: block all other API until account is created.
+        tracing::warn!("setup required; blocked {method} {path}");
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let headers = req.headers();
     let provided = extract_token(headers);
-    if provided.as_deref() == Some(expected.as_str()) {
-        return Ok(next.run(req).await);
+
+    // 1) Operator session token
+    if let Some(ref token) = provided {
+        if state.inner.auth.validate_session(token).is_some() {
+            return Ok(next.run(req).await);
+        }
+    }
+
+    // 2) Legacy machine token (SMOS_AUTH_TOKEN) — optional automation bypass
+    if let Some(expected) = state.auth_token() {
+        if provided.as_deref() == Some(expected.as_str()) {
+            return Ok(next.run(req).await);
+        }
     }
 
     tracing::warn!("auth failed for {method} {path}");
@@ -164,6 +246,9 @@ async fn auth_middleware(
 }
 
 fn extract_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get("x-smos-session").and_then(|v| v.to_str().ok()) {
+        return Some(v.to_string());
+    }
     if let Some(v) = headers.get("x-smos-token").and_then(|v| v.to_str().ok()) {
         return Some(v.to_string());
     }
@@ -177,16 +262,242 @@ fn extract_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+fn session_from_headers(headers: &HeaderMap) -> Option<String> {
+    extract_token(headers)
+}
+
+fn map_auth_err(e: anyhow::Error) -> (StatusCode, Json<ApiError>) {
+    let msg = e.to_string();
+    let status = if msg.contains("setup already") || msg.contains("already enabled") {
+        StatusCode::CONFLICT
+    } else if msg.contains("setup required") {
+        StatusCode::FORBIDDEN
+    } else if msg.contains("unauthorized") {
+        StatusCode::UNAUTHORIZED
+    } else if msg.contains("invalid email or password")
+        || msg.contains("invalid OTP")
+        || msg.contains("invalid or expired")
+        || msg.contains("invalid password")
+    {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(ApiError {
+            error: msg,
+        }),
+    )
+}
+
+async fn health(State(state): State<AppState>, headers: HeaderMap) -> Json<HealthResponse> {
     let cfg = state.inner.config.read();
     let started = state.inner.started_at;
     let uptime = (chrono::Utc::now() - started).num_seconds();
+    let token = session_from_headers(&headers);
+    let st = state.inner.auth.status(token.as_deref());
     Json(HealthResponse {
         status: "ok",
         version: state.inner.version,
         host_label: cfg.host_label.clone(),
         started_at: started,
         uptime_secs: uptime,
+        setup_required: st.setup_required,
+        authenticated: st.authenticated,
+    })
+}
+
+async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> Json<AuthStatus> {
+    let token = session_from_headers(&headers);
+    Json(state.inner.auth.status(token.as_deref()))
+}
+
+async fn auth_setup(
+    State(state): State<AppState>,
+    Json(body): Json<SetupRequest>,
+) -> Result<Json<SetupResponse>, (StatusCode, Json<ApiError>)> {
+    let result = state
+        .inner
+        .auth
+        .setup_with_totp_option(&body.email, &body.password, body.enable_totp)
+        .map_err(map_auth_err)?;
+    let _ = state.inner.audit.append(
+        "auth.setup",
+        body.email.trim(),
+        "account",
+        json!({ "email": result.0.email, "totp_enrolled": result.1.is_some() }),
+        true,
+    );
+    Ok(Json(SetupResponse {
+        login: result.0,
+        totp: result.1,
+    }))
+}
+
+async fn auth_login(
+    State(state): State<AppState>,
+    Json(body): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, (StatusCode, Json<ApiError>)> {
+    let res = state
+        .inner
+        .auth
+        .login(&body.email, &body.password)
+        .map_err(map_auth_err)?;
+    let _ = state.inner.audit.append(
+        "auth.login",
+        body.email.trim(),
+        "session",
+        json!({ "status": res.status, "totp_required": res.totp_required }),
+        res.status == "ok" || res.totp_required,
+    );
+    Ok(Json(res))
+}
+
+async fn auth_login_totp(
+    State(state): State<AppState>,
+    Json(body): Json<TotpLoginRequest>,
+) -> Result<Json<LoginResponse>, (StatusCode, Json<ApiError>)> {
+    let res = state
+        .inner
+        .auth
+        .verify_login_totp(&body.pending_token, &body.code)
+        .map_err(map_auth_err)?;
+    let _ = state.inner.audit.append(
+        "auth.login.totp",
+        res.email.as_deref().unwrap_or("operator"),
+        "session",
+        json!({ "status": res.status }),
+        true,
+    );
+    Ok(Json(res))
+}
+
+async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Json<OkResponse> {
+    if let Some(token) = session_from_headers(&headers) {
+        let email = state.inner.auth.validate_session(&token);
+        state.inner.auth.logout(&token);
+        let _ = state.inner.audit.append(
+            "auth.logout",
+            email.as_deref().unwrap_or("operator"),
+            "session",
+            json!({}),
+            true,
+        );
+    }
+    Json(OkResponse { ok: true })
+}
+
+async fn auth_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AuthStatus>, (StatusCode, Json<ApiError>)> {
+    let token = session_from_headers(&headers);
+    let st = state.inner.auth.status(token.as_deref());
+    if !st.authenticated && !state.inner.auth.setup_required() {
+        // Machine token counts as authenticated for automation but has no email.
+        if let Some(expected) = state.auth_token() {
+            if token.as_deref() == Some(expected.as_str()) {
+                return Ok(Json(AuthStatus {
+                    setup_required: false,
+                    authenticated: true,
+                    email: None,
+                    totp_enabled: state.inner.auth.totp_enabled(),
+                    session_ttl_hours: st.session_ttl_hours,
+                }));
+            }
+        }
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "not authenticated".into(),
+            }),
+        ));
+    }
+    Ok(Json(st))
+}
+
+async fn auth_totp_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<TotpSetupResponse>, (StatusCode, Json<ApiError>)> {
+    let email = require_session_email(&state, &headers)?;
+    let res = state
+        .inner
+        .auth
+        .begin_totp_setup(&email)
+        .map_err(map_auth_err)?;
+    let _ = state.inner.audit.append(
+        "auth.totp.setup",
+        &email,
+        "totp",
+        json!({ "account": res.account }),
+        true,
+    );
+    Ok(Json(res))
+}
+
+async fn auth_totp_enable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TotpCodeRequest>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
+    let email = require_session_email(&state, &headers)?;
+    state
+        .inner
+        .auth
+        .enable_totp(&email, &body.code)
+        .map_err(map_auth_err)?;
+    let _ = state.inner.audit.append(
+        "auth.totp.enable",
+        &email,
+        "totp",
+        json!({}),
+        true,
+    );
+    Ok(Json(OkResponse { ok: true }))
+}
+
+async fn auth_totp_disable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TotpDisableRequest>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<ApiError>)> {
+    let email = require_session_email(&state, &headers)?;
+    state
+        .inner
+        .auth
+        .disable_totp(&email, &body.password, &body.code)
+        .map_err(map_auth_err)?;
+    let _ = state.inner.audit.append(
+        "auth.totp.disable",
+        &email,
+        "totp",
+        json!({}),
+        true,
+    );
+    Ok(Json(OkResponse { ok: true }))
+}
+
+fn require_session_email(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, Json<ApiError>)> {
+    let token = session_from_headers(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "not authenticated".into(),
+            }),
+        )
+    })?;
+    state.inner.auth.validate_session(&token).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                error: "not authenticated".into(),
+            }),
+        )
     })
 }
 
