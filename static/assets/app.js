@@ -7,6 +7,9 @@
     route: "overview",
     health: null,
     metrics: null,
+    metricsHistory: null,
+    historyRangeHours: 24,
+    historyStatus: null,
     processes: [],
     logs: [],
     logTail: null,
@@ -185,6 +188,43 @@
       </div>`;
   }
 
+  function historySeries(key) {
+    const samples = state.metricsHistory?.samples || [];
+    return samples.map(s => Number(s[key]) || 0);
+  }
+
+  function renderHistoryToolbar() {
+    const hours = state.historyRangeHours || 24;
+    const opts = [
+      [1, "1h"], [6, "6h"], [24, "24h"], [72, "3d"], [168, "7d"], [720, "30d"],
+    ];
+    const buttons = opts.map(([h, label]) =>
+      `<button type="button" class="btn ${hours === h ? "" : "secondary"}" data-hist-hours="${h}">${label}</button>`
+    ).join(" ");
+    const count = state.metricsHistory?.count ?? 0;
+    const ret = state.metricsHistory?.retention_days
+      ?? state.config?.history_retention_days
+      ?? 30;
+    return `
+      <div class="card full">
+        <h3>Stored history</h3>
+        <p class="muted">Samples are written every ${state.config?.metrics_history_interval_secs || 60}s and kept for <strong>${ret} days</strong> (change under Config).</p>
+        <div class="log-toolbar" style="flex-wrap:wrap;gap:0.4rem">${buttons}
+          <span class="muted" style="margin-left:0.5rem">${count} points · range ${hours}h</span>
+        </div>
+        <div class="grid" style="margin-top:1rem">
+          <div class="card">
+            <h3>CPU history</h3>
+            ${spark(historySeries("cpu").length ? historySeries("cpu") : state.cpuHistory)}
+          </div>
+          <div class="card">
+            <h3>Memory history</h3>
+            ${spark(historySeries("mem").length ? historySeries("mem") : state.memHistory)}
+          </div>
+        </div>
+      </div>`;
+  }
+
   function renderMetrics() {
     const m = state.metrics;
     if (!m) return `<div class="empty">Loading…</div>`;
@@ -202,6 +242,7 @@
     ).join("");
     return `
       <div class="grid">
+        ${renderHistoryToolbar()}
         <div class="card">
           <h3>CPU global</h3>
           <div class="metric-value">${fmtPct(m.cpu.usage_percent)}</div>
@@ -272,17 +313,23 @@
       `<option value="${esc(s.id)}" ${state.logTail && state.logTail.source_id === s.id ? "selected" : ""}>${esc(s.label)} ${s.exists ? "" : "(missing)"}</option>`
     ).join("");
     const lines = (state.logTail?.lines || []).map(l => esc(l)).join("\n");
+    const ret = state.config?.history_retention_days ?? 30;
+    const histFiles = state.historyStatus?.log_files || [];
+    const histNote = histFiles.length
+      ? `${histFiles.length} log file(s) on disk · ${fmtBytes(state.historyStatus.log_bytes_total || 0)}`
+      : "Daily log files appear under data dir as smos.log.YYYY-MM-DD";
     return `
       <div class="grid">
         <div class="card full">
           <h3>Log sources</h3>
+          <p class="muted">Service logs rotate daily and are retained for <strong>${ret} days</strong>. Older days appear as History sources below.</p>
           <div class="log-toolbar">
             <select id="log-source">${sources || '<option value="smos-service">smos-service</option>'}</select>
             <label class="muted">Lines <input id="log-lines" type="number" min="10" max="5000" value="${state.logTail?.line_count || 200}" style="width:90px" /></label>
             <button class="btn" id="log-load">Load</button>
           </div>
           <div class="log-box" id="log-box">${lines || "No log lines yet."}</div>
-          <div class="muted" style="margin-top:0.5rem">${state.logTail ? esc(state.logTail.path) + " · " + state.logTail.line_count + " lines" : ""}</div>
+          <div class="muted" style="margin-top:0.5rem">${state.logTail ? esc(state.logTail.path) + " · " + state.logTail.line_count + " lines" : ""} · ${esc(histNote)}</div>
         </div>
       </div>`;
   }
@@ -290,6 +337,7 @@
   function renderConfig() {
     const c = state.config;
     if (!c) return `<div class="empty">Loading config…</div>`;
+    const hs = state.historyStatus;
     return `
       <div class="grid">
         <div class="card wide">
@@ -299,6 +347,8 @@
             <label>Bind address<input name="bind" value="${esc(c.bind)}" required /></label>
             <label>Log tail lines<input name="log_tail_lines" type="number" min="1" max="50000" value="${c.log_tail_lines}" /></label>
             <label>Metrics poll (sec)<input name="metrics_poll_secs" type="number" min="1" max="3600" value="${c.metrics_poll_secs}" /></label>
+            <label>History retention (days)<input name="history_retention_days" type="number" min="1" max="3650" value="${c.history_retention_days ?? 30}" /></label>
+            <label>Metrics history interval (sec)<input name="metrics_history_interval_secs" type="number" min="10" max="3600" value="${c.metrics_history_interval_secs ?? 60}" /></label>
             <label class="full">Data dir<input value="${esc(c.data_dir)}" disabled /></label>
             <label class="full">Auth token set: <strong>${c.auth_token_set ? "yes" : "no"}</strong> (set via CLI/env SMOS_AUTH_TOKEN)</label>
             <div class="form-actions full">
@@ -306,6 +356,16 @@
             </div>
           </form>
           <div id="config-msg"></div>
+        </div>
+        <div class="card">
+          <h3>History storage</h3>
+          <p class="muted">Default retention is <strong>30 days</strong>. Increase retention here to keep metrics and rotated logs longer. Interval changes apply to new samples; prune runs hourly.</p>
+          ${hs ? `<table>
+            <tr><th>Metrics samples</th><td class="mono">${hs.metrics_samples_on_disk}</td></tr>
+            <tr><th>Metrics file size</th><td class="mono">${fmtBytes(hs.metrics_bytes)}</td></tr>
+            <tr><th>Log files</th><td class="mono">${(hs.log_files || []).length} · ${fmtBytes(hs.log_bytes_total)}</td></tr>
+            <tr><th>Oldest sample</th><td class="mono">${esc(hs.metrics_oldest || "—")}</td></tr>
+          </table>` : `<p class="muted">Loading history status…</p>`}
         </div>
         <div class="card">
           <h3>Notes</h3>
@@ -372,6 +432,18 @@
       });
     }
 
+    $$("[data-hist-hours]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        state.historyRangeHours = Number(btn.dataset.histHours) || 24;
+        try {
+          await loadMetricsHistory();
+          render();
+        } catch (e) {
+          alert(e.message);
+        }
+      });
+    });
+
     const form = $("#config-form");
     if (form) {
       form.addEventListener("submit", async (ev) => {
@@ -382,6 +454,8 @@
           bind: fd.get("bind"),
           log_tail_lines: Number(fd.get("log_tail_lines")),
           metrics_poll_secs: Number(fd.get("metrics_poll_secs")),
+          history_retention_days: Number(fd.get("history_retention_days")),
+          metrics_history_interval_secs: Number(fd.get("metrics_history_interval_secs")),
         };
         const msg = $("#config-msg");
         try {
@@ -390,6 +464,7 @@
           msg.textContent = "Configuration saved.";
           await loadAudit();
           await loadHealth();
+          await loadHistoryStatus();
         } catch (e) {
           msg.className = "msg err";
           msg.textContent = e.message;
@@ -413,12 +488,22 @@
     if (state.memHistory.length > 40) state.memHistory.shift();
   }
 
+  async function loadMetricsHistory() {
+    const hours = state.historyRangeHours || 24;
+    state.metricsHistory = await api(`/metrics/history?hours=${hours}&limit=500`);
+  }
+
+  async function loadHistoryStatus() {
+    state.historyStatus = await api("/history");
+  }
+
   async function loadProcesses() {
     state.processes = await api("/processes");
   }
 
   async function loadLogs() {
     state.logs = await api("/logs");
+    try { await loadHistoryStatus(); } catch { /* optional */ }
     if (!state.logTail && state.logs[0]) {
       state.logTail = await api(`/logs/${encodeURIComponent(state.logs[0].id)}?lines=200`);
     }
@@ -426,6 +511,7 @@
 
   async function loadConfig() {
     state.config = await api("/config");
+    try { await loadHistoryStatus(); } catch { /* optional */ }
   }
 
   async function loadAudit() {
@@ -437,6 +523,9 @@
       await loadHealth();
       await loadMetrics();
       if (state.route === "processes" || state.route === "overview") await loadProcesses();
+      if (state.route === "metrics" || state.route === "overview") {
+        try { await loadMetricsHistory(); } catch { /* empty history ok */ }
+      }
       if (state.route === "logs") await loadLogs();
       if (state.route === "config") await loadConfig();
       if (state.route === "audit") await loadAudit();

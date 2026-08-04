@@ -30,7 +30,7 @@ pub struct LogTail {
 pub const SERVICE_LOG_ID: &str = "smos-service";
 
 pub fn service_log_source(data_dir: &Path) -> LogSourceInfo {
-    let path = data_dir.join("smos.log");
+    let path = crate::config::SmosConfig::service_log_path(data_dir);
     source_info(SERVICE_LOG_ID, "SMOS service log", &path)
 }
 
@@ -120,10 +120,10 @@ pub fn tail_source(
     })
 }
 
-/// Append a line to the service log (used by tests / controlled writes).
+/// Append a line to the active service log (used by tests / controlled writes).
 pub fn append_service_line(data_dir: &Path, line: &str) -> Result<PathBuf> {
     fs::create_dir_all(data_dir)?;
-    let path = data_dir.join("smos.log");
+    let path = crate::config::SmosConfig::service_log_path(data_dir);
     use std::io::Write;
     let mut f = fs::OpenOptions::new()
         .create(true)
@@ -157,9 +157,9 @@ mod tests {
     #[test]
     fn service_log_append_and_tail() {
         let dir = tempdir().unwrap();
-        append_service_line(dir.path(), "hello-smos-log").unwrap();
+        let path = append_service_line(dir.path(), "hello-smos-log").unwrap();
         append_service_line(dir.path(), "second-line").unwrap();
-        let tail = tail_source(SERVICE_LOG_ID, &dir.path().join("smos.log"), 50).unwrap();
+        let tail = tail_source(SERVICE_LOG_ID, &path, 50).unwrap();
         assert!(tail.lines.iter().any(|l| l.contains("hello-smos-log")));
         assert!(tail.lines.iter().any(|l| l.contains("second-line")));
         assert!(tail.line_count >= 2);

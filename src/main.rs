@@ -40,17 +40,9 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&cli.data_dir)
         .with_context(|| format!("create data dir {}", cli.data_dir.display()))?;
 
-    let log_path = SmosConfig::service_log_path(&cli.data_dir);
-    let file_appender = tracing_appender::rolling::never(
-        log_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".")),
-        log_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("smos.log"),
-    );
+    // Daily rotation so log history can be retained / pruned by calendar day.
+    // Files: smos.log.YYYY-MM-DD under data_dir (plus active writer file).
+    let file_appender = tracing_appender::rolling::daily(&cli.data_dir, "smos.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -110,6 +102,9 @@ async fn main() -> Result<()> {
     );
 
     let state = AppState::new(config);
+    // Background: sample metrics history + prune past retention.
+    tokio::spawn(history_worker(state.clone()));
+
     let app = api::router(state, static_dir);
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -124,6 +119,59 @@ async fn main() -> Result<()> {
         .context("server error")?;
 
     Ok(())
+}
+
+/// Persist metrics samples and prune metrics/logs older than retention.
+async fn history_worker(state: AppState) {
+    // Initial prune shortly after start.
+    {
+        let cfg = state.inner.config.read().clone();
+        let data_dir = cfg.data_dir.clone();
+        let days = cfg.history_retention_days;
+        let _ = tokio::task::spawn_blocking(move || smos::history::prune_all(&data_dir, days)).await;
+    }
+
+    let mut last_prune = std::time::Instant::now();
+    loop {
+        let (interval_secs, data_dir, retention_days) = {
+            let cfg = state.inner.config.read();
+            (
+                cfg.metrics_history_interval_secs.max(10),
+                cfg.data_dir.clone(),
+                cfg.history_retention_days,
+            )
+        };
+
+        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+
+        let dir = data_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            let snap = smos::metrics::collect_metrics();
+            smos::history::record_metrics_snapshot(&dir, &snap)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("metrics history sample failed: {e}"),
+            Err(e) => tracing::warn!("metrics history task join failed: {e}"),
+        }
+
+        // Prune at most hourly (or when interval is longer).
+        let prune_every = std::time::Duration::from_secs(3600);
+        if last_prune.elapsed() >= prune_every {
+            let dir = data_dir.clone();
+            let days = retention_days;
+            match tokio::task::spawn_blocking(move || smos::history::prune_all(&dir, days)).await {
+                Ok(Ok((m, l))) if m > 0 || l > 0 => {
+                    tracing::info!(metrics_pruned = m, logs_pruned = l, "history prune complete");
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("history prune failed: {e}"),
+                Err(e) => tracing::warn!("history prune task join failed: {e}"),
+            }
+            last_prune = std::time::Instant::now();
+        }
+    }
 }
 
 async fn shutdown_signal() {

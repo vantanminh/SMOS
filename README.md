@@ -7,8 +7,9 @@ Rust service for VPS host management: **metrics**, **processes**, **logs**, **co
 | Area | Capability |
 | --- | --- |
 | Performance | Live CPU, memory, disk (and load average on Unix) via `sysinfo` |
+| History | Persist metrics samples + daily service logs; **default 30-day retention** (configurable) |
 | Processes | List running processes; terminate / kill (self-process blocked) |
-| Logs | Tail SMOS service log + allowlisted extra paths |
+| Logs | Tail SMOS service log, daily history files, + allowlisted extra paths |
 | Config | Read/update validated config; persisted to `config.json` |
 | Audit | Append-only JSONL journal for mutating actions |
 | WebUI | Hash-routed SPA (`#/overview`, `#/metrics`, `#/processes`, `#/logs`, `#/config`, `#/audit`) |
@@ -213,33 +214,48 @@ sudo chown -R smos:smos /var/lib/smos
 | --- | --- | --- |
 | GET | `/api/health` | Liveness + version + host label |
 | GET | `/api/metrics` | Live host metrics snapshot |
+| GET | `/api/metrics/history?hours=N&limit=M` | Stored metrics samples (default last 24h) |
+| GET | `/api/history` | History storage status (sizes, counts, log files) |
 | GET | `/api/processes` | Process list |
 | POST | `/api/processes/{pid}/action` | Body: `{"action":"terminate"\|"kill"}` |
-| GET | `/api/logs` | Log sources |
-| GET | `/api/logs/{source_id}?lines=N` | Tail log source (`smos-service` built-in) |
+| GET | `/api/logs` | Log sources (live + daily history files) |
+| GET | `/api/logs/{source_id}?lines=N` | Tail log source (`smos-service` or `history:smos.log.YYYY-MM-DD`) |
 | GET | `/api/config` | Public config (token redacted) |
 | PUT | `/api/config` | Partial update (validated + audited) |
 | GET | `/api/audit?limit=N` | Audit journal (newest first) |
 | GET | `/` | WebUI dashboard |
+
+### History retention
+
+| Config field | Default | Meaning |
+| --- | --- | --- |
+| `history_retention_days` | **30** | Keep metrics samples and rotated daily logs for this many days (1–3650) |
+| `metrics_history_interval_secs` | **60** | How often the service appends a metrics sample to disk (10–3600) |
+
+Change either field in the **Config** page or via `PUT /api/config`. Prune runs on startup and about once per hour.
 
 ### Example
 
 ```bash
 curl -s http://127.0.0.1:9090/api/health | jq
 curl -s http://127.0.0.1:9090/api/metrics | jq '.cpu,.memory.usage_percent'
+curl -s 'http://127.0.0.1:9090/api/metrics/history?hours=24&limit=200' | jq '.count, .retention_days'
+curl -s http://127.0.0.1:9090/api/history | jq
 curl -s -X PUT http://127.0.0.1:9090/api/config \
   -H 'Content-Type: application/json' \
-  -d '{"host_label":"edge-1","log_tail_lines":300}'
+  -d '{"host_label":"edge-1","history_retention_days":90}'
 curl -s http://127.0.0.1:9090/api/audit?limit=5 | jq
 ```
 
 ## Data directory layout
 
 ```
-smos-data/           # or --data-dir
-  config.json        # persisted configuration
-  audit.jsonl        # append-only audit journal
-  smos.log           # service log (also browsable in UI)
+smos-data/                    # or --data-dir
+  config.json                 # persisted configuration
+  audit.jsonl                 # append-only audit journal
+  smos.log.YYYY-MM-DD         # daily rotated service logs (browsable in UI)
+  history/
+    metrics.jsonl             # compact metrics samples (pruned by retention)
 ```
 
 ## Development

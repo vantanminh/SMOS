@@ -87,6 +87,24 @@ fn install_script_automates_place_and_service() {
 }
 
 #[test]
+fn install_script_upgrades_without_text_file_busy() {
+    let body = read_install_script();
+    // Must stop running service and/or replace binary via rename (not in-place cp).
+    assert!(
+        body.contains("stop_smos_if_running") || body.contains("systemctl stop smos"),
+        "upgrade path should stop smos before replacing the binary"
+    );
+    assert!(
+        body.contains("install_binary") || body.contains(".new."),
+        "upgrade path should stage a new binary before replacing"
+    );
+    assert!(
+        body.contains("mv -f") || body.contains("mv "),
+        "upgrade path should use mv/rename to avoid ETXTBSY (Text file busy)"
+    );
+}
+
+#[test]
 fn install_script_documents_github_raw_usage() {
     let body = read_install_script();
     assert!(

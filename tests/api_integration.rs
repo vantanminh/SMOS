@@ -81,7 +81,8 @@ async fn config_update_and_audit() {
 
     let body = serde_json::json!({
         "host_label": "updated-label",
-        "log_tail_lines": 321
+        "log_tail_lines": 321,
+        "history_retention_days": 90
     });
     let res = app
         .clone()
@@ -100,10 +101,13 @@ async fn config_update_and_audit() {
     let cfg: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(cfg["host_label"], "updated-label");
     assert_eq!(cfg["log_tail_lines"], 321);
+    assert_eq!(cfg["history_retention_days"], 90);
 
     let (st, cfg2) = json_get(&app, "/api/config").await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(cfg2["host_label"], "updated-label");
+    assert_eq!(cfg2["history_retention_days"], 90);
+    assert_eq!(cfg2["metrics_history_interval_secs"], 60);
 
     let (st, audit) = json_get(&app, "/api/audit?limit=20").await;
     assert_eq!(st, StatusCode::OK);
@@ -114,6 +118,33 @@ async fn config_update_and_audit() {
             .any(|e| e["action"] == "config.update" && e["success"] == true),
         "audit must contain successful config.update: {entries:?}"
     );
+}
+
+#[tokio::test]
+async fn metrics_history_and_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = test_state(dir.path());
+    let app = api::router(state, resolve_static_dir());
+
+    // Seed durable history the same way the background worker does.
+    let snap = smos::metrics::collect_metrics();
+    smos::history::record_metrics_snapshot(dir.path(), &snap).unwrap();
+    smos::history::record_metrics_snapshot(dir.path(), &snap).unwrap();
+
+    let (st, hist) = json_get(&app, "/api/metrics/history?hours=24&limit=100").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(hist["retention_days"], 30);
+    assert_eq!(hist["sample_interval_secs"], 60);
+    let samples = hist["samples"].as_array().unwrap();
+    assert!(samples.len() >= 2, "expected seeded samples: {hist}");
+    assert!(samples[0]["cpu"].as_f64().is_some());
+    assert!(samples[0]["mem"].as_f64().is_some());
+
+    let (st, status) = json_get(&app, "/api/history").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(status["retention_days"], 30);
+    assert!(status["metrics_samples_on_disk"].as_u64().unwrap() >= 2);
+    assert!(status["metrics_bytes"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test]

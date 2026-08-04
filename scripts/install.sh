@@ -211,11 +211,43 @@ download_and_extract() {
   log "static=${EXTRACTED_STATIC}"
 }
 
+# Stop running service so upgrades can replace the binary cleanly.
+# (Linux returns "Text file busy" if you cp over an executing ELF.)
+stop_smos_if_running() {
+  if [ "$SMOS_SKIP_SERVICE" = "1" ]; then
+    return 0
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+  if systemctl is-active --quiet smos 2>/dev/null; then
+    log "stopping smos service for upgrade"
+    run_as_root systemctl stop smos || log "warning: could not stop smos (will try atomic replace)"
+  fi
+}
+
+# Install binary via temp file + rename. On Linux, `cp` onto a running
+# executable fails with ETXTBSY; `mv` replaces the path atomically.
+install_binary() {
+  local dest="${SMOS_PREFIX}/smos"
+  local tmp="${dest}.new.$$"
+  run_as_root cp "$EXTRACTED_BIN" "$tmp"
+  run_as_root chmod 755 "$tmp"
+  # Prefer install(1) when available; fall back to mv -f.
+  if command -v install >/dev/null 2>&1; then
+    # install still overwrites in-place — use mv for the final step.
+    run_as_root mv -f "$tmp" "$dest"
+  else
+    run_as_root mv -f "$tmp" "$dest"
+  fi
+  run_as_root chmod 755 "$dest"
+}
+
 install_files() {
   log "installing to ${SMOS_PREFIX} (data: ${SMOS_DATA_DIR})"
+  stop_smos_if_running
   run_as_root mkdir -p "$SMOS_PREFIX" "$SMOS_DATA_DIR"
-  run_as_root cp "$EXTRACTED_BIN" "${SMOS_PREFIX}/smos"
-  run_as_root chmod 755 "${SMOS_PREFIX}/smos"
+  install_binary
   run_as_root rm -rf "${SMOS_PREFIX}/static"
   run_as_root cp -a "$EXTRACTED_STATIC" "${SMOS_PREFIX}/static"
 
@@ -322,7 +354,7 @@ SMOS installed from GitHub Release (prebuilt).
   Health:    http://${SMOS_BIND}/api/health
   Service:   systemctl status smos
 
-Reinstall / upgrade:
+Reinstall / upgrade (safe while service is running — stops, replaces binary, restarts):
   curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | bash
 
 Pin a version:

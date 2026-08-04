@@ -24,6 +24,20 @@ pub struct SmosConfig {
     pub host_label: String,
     /// Metrics poll interval hint for the UI (seconds).
     pub metrics_poll_secs: u64,
+    /// How many days of metrics/log history to retain on disk (default 30).
+    #[serde(default = "default_history_retention_days")]
+    pub history_retention_days: u32,
+    /// How often to persist a metrics sample for history (seconds).
+    #[serde(default = "default_metrics_history_interval_secs")]
+    pub metrics_history_interval_secs: u64,
+}
+
+fn default_history_retention_days() -> u32 {
+    30
+}
+
+fn default_metrics_history_interval_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,6 +57,10 @@ pub struct SmosConfigFile {
     pub log_sources: Vec<LogSource>,
     pub host_label: String,
     pub metrics_poll_secs: u64,
+    #[serde(default = "default_history_retention_days")]
+    pub history_retention_days: u32,
+    #[serde(default = "default_metrics_history_interval_secs")]
+    pub metrics_history_interval_secs: u64,
 }
 
 impl Default for SmosConfig {
@@ -55,6 +73,8 @@ impl Default for SmosConfig {
             log_sources: Vec::new(),
             host_label: "smos-host".into(),
             metrics_poll_secs: 2,
+            history_retention_days: default_history_retention_days(),
+            metrics_history_interval_secs: default_metrics_history_interval_secs(),
         }
     }
 }
@@ -69,6 +89,8 @@ impl From<SmosConfig> for SmosConfigFile {
             log_sources: c.log_sources,
             host_label: c.host_label,
             metrics_poll_secs: c.metrics_poll_secs,
+            history_retention_days: c.history_retention_days,
+            metrics_history_interval_secs: c.metrics_history_interval_secs,
         }
     }
 }
@@ -83,6 +105,8 @@ impl From<SmosConfigFile> for SmosConfig {
             log_sources: c.log_sources,
             host_label: c.host_label,
             metrics_poll_secs: c.metrics_poll_secs,
+            history_retention_days: c.history_retention_days,
+            metrics_history_interval_secs: c.metrics_history_interval_secs,
         }
     }
 }
@@ -96,6 +120,8 @@ pub struct ConfigUpdate {
     pub host_label: Option<String>,
     pub metrics_poll_secs: Option<u64>,
     pub log_sources: Option<Vec<LogSource>>,
+    pub history_retention_days: Option<u32>,
+    pub metrics_history_interval_secs: Option<u64>,
 }
 
 impl SmosConfig {
@@ -103,8 +129,20 @@ impl SmosConfig {
         data_dir.join("config.json")
     }
 
+    /// Active service log path for the current UTC day (`smos.log.YYYY-MM-DD`).
+    /// Falls back to legacy `smos.log` when present (tests / older installs).
     pub fn service_log_path(data_dir: &Path) -> PathBuf {
-        data_dir.join("smos.log")
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        let rotated = data_dir.join(format!("smos.log.{today}"));
+        if rotated.exists() {
+            return rotated;
+        }
+        let legacy = data_dir.join("smos.log");
+        if legacy.exists() {
+            return legacy;
+        }
+        // Prefer daily name so it matches tracing_appender::rolling::daily.
+        rotated
     }
 
     pub fn audit_path(data_dir: &Path) -> PathBuf {
@@ -170,6 +208,14 @@ impl SmosConfig {
         if self.metrics_poll_secs == 0 || self.metrics_poll_secs > 3600 {
             bail!("metrics_poll_secs must be between 1 and 3600");
         }
+        if self.history_retention_days == 0 || self.history_retention_days > 3650 {
+            bail!("history_retention_days must be between 1 and 3650");
+        }
+        if self.metrics_history_interval_secs < 10
+            || self.metrics_history_interval_secs > 3600
+        {
+            bail!("metrics_history_interval_secs must be between 10 and 3600");
+        }
         for src in &self.log_sources {
             if src.id.trim().is_empty() {
                 bail!("log source id must not be empty");
@@ -207,6 +253,12 @@ impl SmosConfig {
         if let Some(sources) = update.log_sources {
             next.log_sources = sources;
         }
+        if let Some(days) = update.history_retention_days {
+            next.history_retention_days = days;
+        }
+        if let Some(secs) = update.metrics_history_interval_secs {
+            next.metrics_history_interval_secs = secs;
+        }
         next.validate()?;
         *self = next;
         Ok(())
@@ -222,6 +274,8 @@ impl SmosConfig {
             log_sources: self.log_sources.clone(),
             host_label: self.host_label.clone(),
             metrics_poll_secs: self.metrics_poll_secs,
+            history_retention_days: self.history_retention_days,
+            metrics_history_interval_secs: self.metrics_history_interval_secs,
         }
     }
 }
@@ -235,6 +289,8 @@ pub struct PublicConfig {
     pub log_sources: Vec<LogSource>,
     pub host_label: String,
     pub metrics_poll_secs: u64,
+    pub history_retention_days: u32,
+    pub metrics_history_interval_secs: u64,
 }
 
 #[cfg(test)]
@@ -285,6 +341,45 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("log_tail_lines"));
+    }
+
+    #[test]
+    fn history_retention_defaults_and_validates() {
+        let cfg = SmosConfig::default();
+        assert_eq!(cfg.history_retention_days, 30);
+        assert_eq!(cfg.metrics_history_interval_secs, 60);
+        cfg.validate().unwrap();
+
+        let mut bad = SmosConfig::default();
+        bad.history_retention_days = 0;
+        assert!(bad.validate().is_err());
+        bad.history_retention_days = 30;
+        bad.metrics_history_interval_secs = 5;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn load_missing_history_fields_uses_defaults() {
+        let dir = tempdir().unwrap();
+        let path = SmosConfig::config_path(dir.path());
+        // Legacy config without history keys must still load.
+        fs::write(
+            &path,
+            r#"{
+              "bind": "127.0.0.1:9090",
+              "auth_token": null,
+              "data_dir": "ignored",
+              "log_tail_lines": 200,
+              "log_sources": [],
+              "host_label": "legacy",
+              "metrics_poll_secs": 2
+            }"#,
+        )
+        .unwrap();
+        let loaded = SmosConfig::load_or_default(dir.path()).unwrap();
+        assert_eq!(loaded.host_label, "legacy");
+        assert_eq!(loaded.history_retention_days, 30);
+        assert_eq!(loaded.metrics_history_interval_secs, 60);
     }
 
     #[test]

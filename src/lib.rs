@@ -6,6 +6,7 @@
 pub mod api;
 pub mod audit;
 pub mod config;
+pub mod history;
 pub mod logs;
 pub mod metrics;
 pub mod processes;
