@@ -3,6 +3,7 @@
 //! Domain modules are shared by the binary entry point and tests so assertions
 //! always exercise the same code paths the HTTP handlers use.
 
+pub mod alerts;
 pub mod api;
 pub mod audit;
 pub mod auth;

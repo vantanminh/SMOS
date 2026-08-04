@@ -1,5 +1,6 @@
 //! HTTP API routes for SMOS.
 
+use crate::alerts::{self, AlertStatus};
 use crate::audit::AuditEntry;
 use crate::auth::{AuthStatus, LoginResponse, TotpSetupResponse};
 use crate::config::{ConfigUpdate, PublicConfig, SmosConfig};
@@ -124,6 +125,7 @@ pub fn router(state: AppState, static_dir: PathBuf) -> Router {
         .route("/metrics", get(get_metrics))
         .route("/metrics/history", get(get_metrics_history))
         .route("/history", get(get_history_status))
+        .route("/alerts", get(get_alerts))
         .route("/processes", get(get_processes))
         .route("/processes/{pid}/action", post(process_action))
         .route("/logs", get(list_log_sources))
@@ -610,6 +612,19 @@ async fn get_history_status(
                 }),
             )
         })
+}
+
+/// Live alert status: compares current metrics snapshot to configured thresholds.
+async fn get_alerts(State(state): State<AppState>) -> Json<AlertStatus> {
+    let thresholds = state.inner.config.read().alert_thresholds();
+    let status = tokio::task::spawn_blocking(move || alerts::collect_alert_status(&thresholds))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("alerts collect join error: {e}");
+            // Fallback: collect on calling thread with defaults if join fails
+            alerts::collect_alert_status(&alerts::AlertThresholds::default())
+        });
+    Json(status)
 }
 
 async fn get_processes(Query(q): Query<ProcessQuery>) -> Json<Vec<ProcessInfo>> {

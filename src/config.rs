@@ -1,5 +1,9 @@
 //! SMOS configuration load, validate, persist.
 
+use crate::alerts::{
+    self, default_alert_cpu_percent, default_alert_disk_percent, default_alert_memory_percent,
+    AlertThresholds,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -30,6 +34,15 @@ pub struct SmosConfig {
     /// How often to persist a metrics sample for history (seconds).
     #[serde(default = "default_metrics_history_interval_secs")]
     pub metrics_history_interval_secs: u64,
+    /// Alert when global CPU usage % is at or above this value (default 90).
+    #[serde(default = "default_alert_cpu_percent")]
+    pub alert_cpu_percent: f64,
+    /// Alert when memory usage % is at or above this value (default 90).
+    #[serde(default = "default_alert_memory_percent")]
+    pub alert_memory_percent: f64,
+    /// Alert when any disk usage % is at or above this value (default 90).
+    #[serde(default = "default_alert_disk_percent")]
+    pub alert_disk_percent: f64,
 }
 
 fn default_history_retention_days() -> u32 {
@@ -61,6 +74,12 @@ pub struct SmosConfigFile {
     pub history_retention_days: u32,
     #[serde(default = "default_metrics_history_interval_secs")]
     pub metrics_history_interval_secs: u64,
+    #[serde(default = "default_alert_cpu_percent")]
+    pub alert_cpu_percent: f64,
+    #[serde(default = "default_alert_memory_percent")]
+    pub alert_memory_percent: f64,
+    #[serde(default = "default_alert_disk_percent")]
+    pub alert_disk_percent: f64,
 }
 
 impl Default for SmosConfig {
@@ -75,6 +94,9 @@ impl Default for SmosConfig {
             metrics_poll_secs: 2,
             history_retention_days: default_history_retention_days(),
             metrics_history_interval_secs: default_metrics_history_interval_secs(),
+            alert_cpu_percent: default_alert_cpu_percent(),
+            alert_memory_percent: default_alert_memory_percent(),
+            alert_disk_percent: default_alert_disk_percent(),
         }
     }
 }
@@ -91,6 +113,9 @@ impl From<SmosConfig> for SmosConfigFile {
             metrics_poll_secs: c.metrics_poll_secs,
             history_retention_days: c.history_retention_days,
             metrics_history_interval_secs: c.metrics_history_interval_secs,
+            alert_cpu_percent: c.alert_cpu_percent,
+            alert_memory_percent: c.alert_memory_percent,
+            alert_disk_percent: c.alert_disk_percent,
         }
     }
 }
@@ -107,6 +132,9 @@ impl From<SmosConfigFile> for SmosConfig {
             metrics_poll_secs: c.metrics_poll_secs,
             history_retention_days: c.history_retention_days,
             metrics_history_interval_secs: c.metrics_history_interval_secs,
+            alert_cpu_percent: c.alert_cpu_percent,
+            alert_memory_percent: c.alert_memory_percent,
+            alert_disk_percent: c.alert_disk_percent,
         }
     }
 }
@@ -122,6 +150,9 @@ pub struct ConfigUpdate {
     pub log_sources: Option<Vec<LogSource>>,
     pub history_retention_days: Option<u32>,
     pub metrics_history_interval_secs: Option<u64>,
+    pub alert_cpu_percent: Option<f64>,
+    pub alert_memory_percent: Option<f64>,
+    pub alert_disk_percent: Option<f64>,
 }
 
 impl SmosConfig {
@@ -216,6 +247,9 @@ impl SmosConfig {
         {
             bail!("metrics_history_interval_secs must be between 10 and 3600");
         }
+        if let Err(msg) = alerts::validate_thresholds(&self.alert_thresholds()) {
+            bail!("{msg}");
+        }
         for src in &self.log_sources {
             if src.id.trim().is_empty() {
                 bail!("log source id must not be empty");
@@ -259,9 +293,27 @@ impl SmosConfig {
         if let Some(secs) = update.metrics_history_interval_secs {
             next.metrics_history_interval_secs = secs;
         }
+        if let Some(v) = update.alert_cpu_percent {
+            next.alert_cpu_percent = v;
+        }
+        if let Some(v) = update.alert_memory_percent {
+            next.alert_memory_percent = v;
+        }
+        if let Some(v) = update.alert_disk_percent {
+            next.alert_disk_percent = v;
+        }
         next.validate()?;
         *self = next;
         Ok(())
+    }
+
+    /// Alert thresholds as a dedicated struct for evaluation.
+    pub fn alert_thresholds(&self) -> AlertThresholds {
+        AlertThresholds {
+            cpu_percent: self.alert_cpu_percent,
+            memory_percent: self.alert_memory_percent,
+            disk_percent: self.alert_disk_percent,
+        }
     }
 
     /// Public view redacts auth token value (presence only).
@@ -276,6 +328,9 @@ impl SmosConfig {
             metrics_poll_secs: self.metrics_poll_secs,
             history_retention_days: self.history_retention_days,
             metrics_history_interval_secs: self.metrics_history_interval_secs,
+            alert_cpu_percent: self.alert_cpu_percent,
+            alert_memory_percent: self.alert_memory_percent,
+            alert_disk_percent: self.alert_disk_percent,
         }
     }
 }
@@ -291,6 +346,9 @@ pub struct PublicConfig {
     pub metrics_poll_secs: u64,
     pub history_retention_days: u32,
     pub metrics_history_interval_secs: u64,
+    pub alert_cpu_percent: f64,
+    pub alert_memory_percent: f64,
+    pub alert_disk_percent: f64,
 }
 
 #[cfg(test)]
@@ -380,6 +438,42 @@ mod tests {
         assert_eq!(loaded.host_label, "legacy");
         assert_eq!(loaded.history_retention_days, 30);
         assert_eq!(loaded.metrics_history_interval_secs, 60);
+        assert_eq!(loaded.alert_cpu_percent, 90.0);
+        assert_eq!(loaded.alert_memory_percent, 90.0);
+        assert_eq!(loaded.alert_disk_percent, 90.0);
+    }
+
+    #[test]
+    fn alert_thresholds_defaults_and_validate() {
+        let cfg = SmosConfig::default();
+        assert_eq!(cfg.alert_cpu_percent, 90.0);
+        let t = cfg.alert_thresholds();
+        assert_eq!(t.cpu_percent, 90.0);
+        cfg.validate().unwrap();
+
+        let mut bad = SmosConfig::default();
+        bad.alert_cpu_percent = 150.0;
+        assert!(bad.validate().is_err());
+        bad.alert_cpu_percent = 80.0;
+        bad.alert_disk_percent = -5.0;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn apply_update_alert_thresholds() {
+        let mut cfg = SmosConfig::default();
+        cfg.apply_update(ConfigUpdate {
+            alert_cpu_percent: Some(75.5),
+            alert_memory_percent: Some(85.0),
+            alert_disk_percent: Some(95.0),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(cfg.alert_cpu_percent, 75.5);
+        assert_eq!(cfg.alert_memory_percent, 85.0);
+        assert_eq!(cfg.alert_disk_percent, 95.0);
+        let view = cfg.public_view();
+        assert_eq!(view.alert_cpu_percent, 75.5);
     }
 
     #[test]

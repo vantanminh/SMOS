@@ -518,6 +518,19 @@ td.mono, .mono { font-family: var(--mono); font-size: 0.85rem; }
   background: linear-gradient(135deg, rgba(61,214,198,0.95), rgba(110,168,255,0.85));
   border-color: transparent;
 }
+.chip.danger {
+  color: var(--danger);
+  border-color: rgba(255, 107, 122, 0.45);
+  background: rgba(255, 107, 122, 0.08);
+  cursor: default;
+}
+.alert-breach {
+  border-color: rgba(255, 107, 122, 0.45) !important;
+  box-shadow: 0 0 0 1px rgba(255, 107, 122, 0.12);
+}
+.alert-ok {
+  border-color: rgba(61, 214, 140, 0.35) !important;
+}
 
 .form-grid {
   display: grid;

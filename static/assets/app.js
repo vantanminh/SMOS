@@ -424,8 +424,22 @@
     const cpu = m.cpu?.usage_percent ?? 0;
     const mem = m.memory?.usage_percent ?? 0;
     const disk = (m.disks && m.disks[0]) || null;
+    const al = state.alerts;
+    const alertBanner = al ? `
+      <div class="card full ${al.any_breached ? "alert-breach" : "alert-ok"}">
+        <h3>Alert status ${al.any_breached ? "· " + al.breach_count + " breach(es)" : "· all clear"}</h3>
+        <p class="muted">Thresholds: CPU ≥ ${al.thresholds?.cpu_percent ?? "—"}% · Mem ≥ ${al.thresholds?.memory_percent ?? "—"}% · Disk ≥ ${al.thresholds?.disk_percent ?? "—"}%</p>
+        <div class="chip-row" style="margin-top:0.5rem">
+          <span class="chip ${al.cpu?.breached ? "danger" : ""}">CPU ${fmtPct(al.cpu?.current)} ${al.cpu?.breached ? "⚠" : "✓"}</span>
+          <span class="chip ${al.memory?.breached ? "danger" : ""}">Mem ${fmtPct(al.memory?.current)} ${al.memory?.breached ? "⚠" : "✓"}</span>
+          ${(al.disks || []).slice(0, 4).map(d =>
+            `<span class="chip ${d.breached ? "danger" : ""}">Disk ${esc(d.scope || "?")} ${fmtPct(d.current)} ${d.breached ? "⚠" : "✓"}</span>`
+          ).join("")}
+        </div>
+      </div>` : "";
     return `
       <div class="grid">
+        ${alertBanner}
         <div class="card">
           <h3>CPU</h3>
           <div class="metric-value">${fmtPct(cpu)}</div>
@@ -710,6 +724,9 @@
             <label>Metrics poll (sec)<input name="metrics_poll_secs" type="number" min="1" max="3600" value="${c.metrics_poll_secs}" /></label>
             <label>History retention (days)<input name="history_retention_days" type="number" min="1" max="3650" value="${c.history_retention_days ?? 30}" /></label>
             <label>Metrics history interval (sec)<input name="metrics_history_interval_secs" type="number" min="10" max="3600" value="${c.metrics_history_interval_secs ?? 60}" /></label>
+            <label>Alert CPU % ≥<input name="alert_cpu_percent" type="number" min="0" max="100" step="0.1" value="${c.alert_cpu_percent ?? 90}" /></label>
+            <label>Alert memory % ≥<input name="alert_memory_percent" type="number" min="0" max="100" step="0.1" value="${c.alert_memory_percent ?? 90}" /></label>
+            <label>Alert disk % ≥<input name="alert_disk_percent" type="number" min="0" max="100" step="0.1" value="${c.alert_disk_percent ?? 90}" /></label>
             <label class="full">Data dir<input value="${esc(c.data_dir)}" disabled /></label>
             <label class="full">Auth token set: <strong>${c.auth_token_set ? "yes" : "no"}</strong> (set via CLI/env SMOS_AUTH_TOKEN)</label>
             <div class="form-actions full">
@@ -717,6 +734,11 @@
             </div>
           </form>
           <div id="config-msg"></div>
+          ${state.alerts ? `
+          <div class="muted" style="margin-top:0.75rem">
+            Live: ${state.alerts.any_breached ? `<strong style="color:var(--danger)">${state.alerts.breach_count} threshold breach(es)</strong>` : "no breaches"}
+            · <a href="#/overview">Overview</a> shows current status vs thresholds.
+          </div>` : ""}
         </div>
         <div class="card">
           <h3>History storage</h3>
@@ -891,6 +913,9 @@
           metrics_poll_secs: Number(fd.get("metrics_poll_secs")),
           history_retention_days: Number(fd.get("history_retention_days")),
           metrics_history_interval_secs: Number(fd.get("metrics_history_interval_secs")),
+          alert_cpu_percent: Number(fd.get("alert_cpu_percent")),
+          alert_memory_percent: Number(fd.get("alert_memory_percent")),
+          alert_disk_percent: Number(fd.get("alert_disk_percent")),
         };
         const msg = $("#config-msg");
         try {
@@ -984,6 +1009,10 @@
     if (state.memHistory.length > 40) state.memHistory.shift();
   }
 
+  async function loadAlerts() {
+    state.alerts = await api("/alerts");
+  }
+
   async function loadMetricsHistory() {
     const hours = state.historyRangeHours || 24;
     state.metricsHistory = await api(`/metrics/history?hours=${hours}&limit=500`);
@@ -1027,6 +1056,9 @@
       await loadHealth();
       await loadAuthStatus();
       await loadMetrics();
+      if (state.route === "overview" || state.route === "config" || state.route === "metrics") {
+        try { await loadAlerts(); } catch { /* optional */ }
+      }
       if (state.route === "processes" || state.route === "overview") await loadProcesses();
       if (state.route === "metrics" || state.route === "overview") {
         try { await loadMetricsHistory(); } catch { /* empty history ok */ }

@@ -468,3 +468,171 @@ async fn live_server_bind_and_health() {
     let ui = http_get(addr, "/").await;
     assert!(ui.contains("SMOS"), "UI body: {}", &ui[..ui.len().min(200)]);
 }
+
+#[tokio::test]
+async fn process_query_filter_and_sort_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, token) = test_state_authed(dir.path());
+    let app = api::router(state, resolve_static_dir());
+
+    let (st, all) = json_get_auth(&app, "/api/processes", Some(&token)).await;
+    assert_eq!(st, StatusCode::OK);
+    let all_arr = all.as_array().unwrap();
+    assert!(!all_arr.is_empty());
+
+    // Sort by memory ascending — check order on returned set
+    let (st, by_mem) =
+        json_get_auth(&app, "/api/processes?sort=memory&order=asc&limit=50", Some(&token)).await;
+    assert_eq!(st, StatusCode::OK);
+    let mem_arr = by_mem.as_array().unwrap();
+    assert!(!mem_arr.is_empty());
+    for w in mem_arr.windows(2) {
+        let a = w[0]["memory_bytes"].as_u64().unwrap();
+        let b = w[1]["memory_bytes"].as_u64().unwrap();
+        assert!(a <= b, "memory asc order broken: {a} > {b}");
+    }
+
+    // Name filter: use a fragment of the first process name
+    let name = all_arr[0]["name"].as_str().unwrap_or("");
+    if name.len() >= 2 {
+        let needle = &name[..name.len().min(3)];
+        let path = format!(
+            "/api/processes?name={}&sort=cpu&order=desc",
+            urlencoding_simple(needle)
+        );
+        let (st, filtered) = json_get_auth(&app, &path, Some(&token)).await;
+        assert_eq!(st, StatusCode::OK);
+        let farr = filtered.as_array().unwrap();
+        assert!(
+            farr.len() <= all_arr.len(),
+            "filter must not grow the set"
+        );
+        for p in farr {
+            let n = p["name"].as_str().unwrap_or("").to_lowercase();
+            let cmd = p["cmd"].as_str().unwrap_or("").to_lowercase();
+            let exe = p["exe"].as_str().unwrap_or("").to_lowercase();
+            let nd = needle.to_lowercase();
+            assert!(
+                n.contains(&nd) || cmd.contains(&nd) || exe.contains(&nd),
+                "process {:?} should match name filter {needle}",
+                p["name"]
+            );
+        }
+    }
+
+    // PID filter exact
+    let pid = all_arr[0]["pid"].as_u64().unwrap();
+    let (st, only) =
+        json_get_auth(&app, &format!("/api/processes?pid={pid}"), Some(&token)).await;
+    assert_eq!(st, StatusCode::OK);
+    let only_arr = only.as_array().unwrap();
+    assert!(only_arr.iter().all(|p| p["pid"].as_u64() == Some(pid)));
+}
+
+/// Minimal percent-encoding for test query strings (letters/digits safe).
+fn urlencoding_simple(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u8)
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn metrics_include_network_interfaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, token) = test_state_authed(dir.path());
+    let app = api::router(state, resolve_static_dir());
+
+    let (st, metrics) = json_get_auth(&app, "/api/metrics", Some(&token)).await;
+    assert_eq!(st, StatusCode::OK);
+    let nets = metrics["networks"]
+        .as_array()
+        .expect("metrics.networks must be an array");
+    assert!(
+        !nets.is_empty(),
+        "expected at least one network interface from sysinfo"
+    );
+    for n in nets {
+        assert!(
+            n["name"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+            "interface name required: {n}"
+        );
+        assert!(n["bytes_received"].as_u64().is_some(), "bytes_received: {n}");
+        assert!(
+            n["bytes_transmitted"].as_u64().is_some(),
+            "bytes_transmitted: {n}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn alerts_status_and_threshold_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, token) = test_state_authed(dir.path());
+    let app = api::router(state, resolve_static_dir());
+
+    // Defaults present on public config
+    let (st, cfg) = json_get_auth(&app, "/api/config", Some(&token)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(cfg["alert_cpu_percent"], 90.0);
+    assert_eq!(cfg["alert_memory_percent"], 90.0);
+    assert_eq!(cfg["alert_disk_percent"], 90.0);
+
+    // Live alerts path uses real metrics
+    let (st, alerts) = json_get_auth(&app, "/api/alerts", Some(&token)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(alerts["thresholds"]["cpu_percent"].as_f64().unwrap() > 0.0);
+    assert!(alerts["cpu"]["current"].as_f64().is_some());
+    assert!(alerts["memory"]["current"].as_f64().is_some());
+    assert!(alerts["cpu"]["breached"].as_bool().is_some());
+    assert!(alerts["any_breached"].as_bool().is_some());
+    assert!(alerts["breach_count"].as_u64().is_some());
+
+    // Set impossible-low CPU threshold so breach is almost certain, then restore
+    let (st, updated) = json_put_auth(
+        &app,
+        "/api/config",
+        &token,
+        serde_json::json!({ "alert_cpu_percent": 0.0 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(updated["alert_cpu_percent"], 0.0);
+
+    let (st, alerts2) = json_get_auth(&app, "/api/alerts", Some(&token)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(alerts2["thresholds"]["cpu_percent"], 0.0);
+    // CPU usage is always >= 0, so threshold 0.0 means breached
+    assert_eq!(alerts2["cpu"]["breached"], true);
+    assert_eq!(alerts2["any_breached"], true);
+    assert!(alerts2["breach_count"].as_u64().unwrap() >= 1);
+
+    // Reject invalid threshold
+    let (st, _) = json_put_auth(
+        &app,
+        "/api/config",
+        &token,
+        serde_json::json!({ "alert_disk_percent": 200.0 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // Restore sane defaults
+    let (st, _) = json_put_auth(
+        &app,
+        "/api/config",
+        &token,
+        serde_json::json!({
+            "alert_cpu_percent": 90.0,
+            "alert_memory_percent": 90.0,
+            "alert_disk_percent": 90.0
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
