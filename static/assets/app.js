@@ -455,9 +455,27 @@
               <tr><th>Host uptime</th><td class="mono">${fmtUptime(m.uptime_secs)}</td></tr>
               <tr><th>SMOS uptime</th><td class="mono">${fmtUptime(h?.uptime_secs)}</td></tr>
               <tr><th>Processes</th><td class="mono">${state.processes.length}</td></tr>
+              <tr><th>Network ifaces</th><td class="mono">${(m.networks || []).length}</td></tr>
             </table>
           </div>
         </div>
+        ${(m.networks && m.networks.length) ? `
+        <div class="card wide">
+          <h3>Network (top interfaces)</h3>
+          <div class="table-wrap table-wrap-auto">
+            <table>
+              <thead><tr><th>Iface</th><th>RX</th><th>TX</th></tr></thead>
+              <tbody>
+                ${m.networks.slice(0, 6).map(n => `
+                  <tr>
+                    <td class="mono">${esc(n.name)}</td>
+                    <td class="mono">${fmtBytes(n.bytes_received)}</td>
+                    <td class="mono">${fmtBytes(n.bytes_transmitted)}</td>
+                  </tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
+        </div>` : ""}
         <div class="card">
           <h3>Quick links</h3>
           <div class="quick-links">
@@ -557,6 +575,24 @@
             <table>
               <thead><tr><th>Mount</th><th>FS</th><th>Used</th><th>%</th></tr></thead>
               <tbody>${disks || '<tr><td colspan="4" class="empty">No disks</td></tr>'}</tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card full">
+          <h3>Network interfaces</h3>
+          <p class="muted">Cumulative counters from the host (sysinfo). RX/TX since interface up / boot.</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Interface</th><th>RX bytes</th><th>TX bytes</th><th>RX pkts</th><th>TX pkts</th></tr></thead>
+              <tbody>${(m.networks || []).map(n => `
+                <tr>
+                  <td class="mono">${esc(n.name)}</td>
+                  <td class="mono">${fmtBytes(n.bytes_received)}</td>
+                  <td class="mono">${fmtBytes(n.bytes_transmitted)}</td>
+                  <td class="mono">${n.packets_received ?? 0}</td>
+                  <td class="mono">${n.packets_transmitted ?? 0}</td>
+                </tr>`).join("") || '<tr><td colspan="5" class="empty">No network interfaces</td></tr>'}
+            </tbody>
             </table>
           </div>
         </div>
