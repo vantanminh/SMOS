@@ -50,23 +50,39 @@ Open the dashboard: **http://127.0.0.1:9090/** (or your bind address).
   - `X-SMOS-Token: <token>`
 - Default bind is **localhost**. For a public VPS, use a firewall, reverse proxy TLS, and set an auth token. Process kill without auth on `0.0.0.0` is unsafe.
 
-## VPS deploy (Linux)
+## Install on Ubuntu server
+
+Copy-paste install for **Ubuntu 22.04 / 24.04** (and similar Debian-based VPS images).
 
 ```bash
-# On the VPS
-git clone <your-repo> smos && cd smos
+# 1) System packages
+sudo apt-get update
+sudo apt-get install -y build-essential curl git pkg-config
+
+# 2) Rust toolchain (rustup)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+rustc --version
+
+# 3) Clone and build SMOS
+git clone https://github.com/<your-org>/SMOS.git smos
+cd smos
 cargo build --release
 
-sudo useradd -r -s /usr/sbin/nologin smos || true
-sudo mkdir -p /var/lib/smos /opt/smos
+# 4) Install binary + WebUI assets
+sudo useradd -r -s /usr/sbin/nologin smos 2>/dev/null || true
+sudo mkdir -p /opt/smos /var/lib/smos
 sudo cp target/release/smos /opt/smos/
 sudo cp -r static /opt/smos/
 sudo chown -R smos:smos /var/lib/smos
-```
+sudo chmod 755 /opt/smos/smos
 
-Example systemd unit `/etc/systemd/system/smos.service`:
+# 5) Auth token (required for mutating APIs if you expose beyond localhost)
+echo 'SMOS_AUTH_TOKEN=change-me-to-a-long-secret' | sudo tee /etc/smos.env
+sudo chmod 600 /etc/smos.env
 
-```ini
+# 6) systemd unit
+sudo tee /etc/systemd/system/smos.service >/dev/null <<'EOF'
 [Unit]
 Description=SMOS Server Management OS
 After=network.target
@@ -75,17 +91,63 @@ After=network.target
 Type=simple
 User=smos
 WorkingDirectory=/opt/smos
-ExecStart=/opt/smos/smos --bind 127.0.0.1:9090 --data-dir /var/lib/smos --host-label %H --auth-token FILE_OR_ENV
+EnvironmentFile=/etc/smos.env
 Environment=RUST_LOG=info
+ExecStart=/opt/smos/smos --bind 127.0.0.1:9090 --data-dir /var/lib/smos --host-label %H
 Restart=on-failure
-# Prefer EnvironmentFile for the token:
-# EnvironmentFile=/etc/smos.env
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# 7) Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now smos
+sudo systemctl status smos --no-pager
+
+# 8) Smoke-check (on the server)
+curl -sS http://127.0.0.1:9090/api/health
 ```
 
-Put the WebUI assets next to the binary (`/opt/smos/static/…`) or run from the repo root so `static/` resolves. Put nginx/Caddy in front for TLS and optional basic auth.
+Open the dashboard via SSH tunnel or reverse proxy:
+
+```bash
+# From your laptop
+ssh -L 9090:127.0.0.1:9090 user@your-ubuntu-server
+# then browse http://127.0.0.1:9090/
+```
+
+Optional: put nginx/Caddy in front of `127.0.0.1:9090` for TLS. Do not bind `0.0.0.0` without a strong `SMOS_AUTH_TOKEN` and firewall.
+
+### Upgrade on Ubuntu
+
+```bash
+cd smos
+git pull
+cargo build --release
+sudo systemctl stop smos
+sudo cp target/release/smos /opt/smos/
+sudo cp -r static /opt/smos/
+sudo systemctl start smos
+```
+
+## CI
+
+GitHub Actions runs on every **push** and **pull_request**: installs stable Rust on `ubuntu-latest`, then `cargo build` and `cargo test` (see `.github/workflows/ci.yml`).
+
+## VPS deploy (Linux, generic)
+
+Same runtime layout as the Ubuntu section (`/opt/smos`, `/var/lib/smos`, systemd). Use the Ubuntu install commands above on Ubuntu servers; on other distros install a C toolchain + rustup, then:
+
+```bash
+git clone <your-repo> smos && cd smos
+cargo build --release
+sudo useradd -r -s /usr/sbin/nologin smos || true
+sudo mkdir -p /var/lib/smos /opt/smos
+sudo cp target/release/smos /opt/smos/
+sudo cp -r static /opt/smos/
+sudo chown -R smos:smos /var/lib/smos
+```
 
 ## API routes
 
