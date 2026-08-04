@@ -65,7 +65,7 @@ source "$HOME/.cargo/env"
 rustc --version
 
 # 3) Clone and build SMOS
-git clone https://github.com/<your-org>/SMOS.git smos
+git clone https://github.com/vantanminh/SMOS.git smos
 cd smos
 cargo build --release
 
@@ -140,7 +140,7 @@ GitHub Actions runs on every **push** and **pull_request**: installs stable Rust
 Same runtime layout as the Ubuntu section (`/opt/smos`, `/var/lib/smos`, systemd). Use the Ubuntu install commands above on Ubuntu servers; on other distros install a C toolchain + rustup, then:
 
 ```bash
-git clone <your-repo> smos && cd smos
+git clone https://github.com/vantanminh/SMOS.git smos && cd smos
 cargo build --release
 sudo useradd -r -s /usr/sbin/nologin smos || true
 sudo mkdir -p /var/lib/smos /opt/smos
