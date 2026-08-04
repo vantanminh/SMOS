@@ -1,36 +1,34 @@
 #!/usr/bin/env bash
-# SMOS one-command installer (Linux / Ubuntu VPS).
+# SMOS one-command installer — downloads a prebuilt GitHub Release (no compile on server).
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | bash
 #
-# Env overrides (for automation / non-root tests):
-#   SMOS_REF=main              git ref to clone
-#   SMOS_REPO=https://github.com/vantanminh/SMOS.git
-#   SMOS_PREFIX=/opt/smos      install prefix (binary + static)
+# Env overrides:
+#   SMOS_VERSION=latest|v0.1.0   release tag (default: latest)
+#   SMOS_REPO=vantanminh/SMOS    GitHub owner/repo
+#   SMOS_PREFIX=/opt/smos
 #   SMOS_DATA_DIR=/var/lib/smos
 #   SMOS_BIND=127.0.0.1:9090
-#   SMOS_SKIP_DEPS=1           skip apt packages
-#   SMOS_SKIP_SERVICE=1        skip systemd unit / enable
-#   SMOS_SKIP_BUILD=0          set 1 only when SMOS_BIN_SRC points at a prebuilt binary
-#   SMOS_BIN_SRC=              optional path to prebuilt smos binary
-#   SMOS_SRC_DIR=              optional existing source tree (skip clone)
-#   SMOS_NONINTERACTIVE=1      default for curl|bash
+#   SMOS_SKIP_DEPS=1             skip apt curl/ca-certificates
+#   SMOS_SKIP_SERVICE=1          skip systemd
+#   SMOS_FROM_SOURCE=1           fallback: clone + cargo build (slow; needs rustc)
+#   SMOS_ASSET_URL=              override direct tarball URL
+#   SMOS_USER=smos
 
 set -euo pipefail
 
-SMOS_REF="${SMOS_REF:-main}"
-SMOS_REPO="${SMOS_REPO:-https://github.com/vantanminh/SMOS.git}"
+SMOS_VERSION="${SMOS_VERSION:-latest}"
+SMOS_REPO="${SMOS_REPO:-vantanminh/SMOS}"
 SMOS_PREFIX="${SMOS_PREFIX:-/opt/smos}"
 SMOS_DATA_DIR="${SMOS_DATA_DIR:-/var/lib/smos}"
 SMOS_BIND="${SMOS_BIND:-127.0.0.1:9090}"
 SMOS_SKIP_DEPS="${SMOS_SKIP_DEPS:-0}"
 SMOS_SKIP_SERVICE="${SMOS_SKIP_SERVICE:-0}"
-SMOS_SKIP_BUILD="${SMOS_SKIP_BUILD:-0}"
-SMOS_BIN_SRC="${SMOS_BIN_SRC:-}"
-SMOS_SRC_DIR="${SMOS_SRC_DIR:-}"
-SMOS_NONINTERACTIVE="${SMOS_NONINTERACTIVE:-1}"
+SMOS_FROM_SOURCE="${SMOS_FROM_SOURCE:-0}"
+SMOS_ASSET_URL="${SMOS_ASSET_URL:-}"
 SMOS_USER="${SMOS_USER:-smos}"
-SMOS_BUILD_DIR="${SMOS_BUILD_DIR:-}"
+SMOS_GITHUB_API="${SMOS_GITHUB_API:-https://api.github.com}"
+SMOS_GITHUB_RAW="${SMOS_GITHUB_RAW:-https://github.com}"
 
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -54,128 +52,163 @@ run_as_root() {
 detect_os() {
   case "$(uname -s)" in
     Linux) ;;
-    *) die "this installer targets Linux (got $(uname -s)). See README for manual install." ;;
+    *) die "this installer targets Linux (got $(uname -s))." ;;
   esac
 }
 
-install_deps() {
+detect_target() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) SMOS_TARGET="x86_64-unknown-linux-gnu" ;;
+    aarch64|arm64) SMOS_TARGET="aarch64-unknown-linux-gnu" ;;
+    *) die "unsupported architecture: $arch (need x86_64 or aarch64)" ;;
+  esac
+  log "detected target ${SMOS_TARGET}"
+}
+
+install_runtime_deps() {
   if [ "$SMOS_SKIP_DEPS" = "1" ]; then
-    log "skipping system deps (SMOS_SKIP_DEPS=1)"
+    log "skipping runtime deps (SMOS_SKIP_DEPS=1)"
     return 0
   fi
   if command -v apt-get >/dev/null 2>&1; then
-    log "installing build dependencies via apt"
+    log "installing runtime packages (curl ca-certificates tar)"
     run_as_root apt-get update -y
-    DEBIAN_FRONTEND=noninteractive run_as_root apt-get install -y \
-      build-essential curl git pkg-config ca-certificates
+    DEBIAN_FRONTEND=noninteractive run_as_root apt-get install -y curl ca-certificates tar gzip
   elif command -v dnf >/dev/null 2>&1; then
-    log "installing build dependencies via dnf"
-    run_as_root dnf install -y gcc gcc-c++ make curl git pkgconf-pkg-config ca-certificates
+    run_as_root dnf install -y curl ca-certificates tar gzip
   elif command -v yum >/dev/null 2>&1; then
-    log "installing build dependencies via yum"
-    run_as_root yum install -y gcc gcc-c++ make curl git pkgconfig ca-certificates
+    run_as_root yum install -y curl ca-certificates tar gzip
   else
-    log "no supported package manager; assuming curl git and a C toolchain exist"
+    log "no apt/dnf/yum; assuming curl and tar exist"
   fi
   need_cmd curl
-  need_cmd git
+  need_cmd tar
 }
 
-ensure_rust() {
-  if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
-    log "rust already available: $(rustc --version)"
+# Resolve release tarball URL from GitHub Releases API.
+resolve_asset_url() {
+  if [ -n "$SMOS_ASSET_URL" ]; then
+    ASSET_URL="$SMOS_ASSET_URL"
+    log "using SMOS_ASSET_URL=${ASSET_URL}"
     return 0
   fi
-  log "installing Rust via rustup"
+
   need_cmd curl
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-  # shellcheck disable=SC1091
-  if [ -f "$HOME/.cargo/env" ]; then
-    # shellcheck source=/dev/null
-    . "$HOME/.cargo/env"
+  local api_url json
+  if [ "$SMOS_VERSION" = "latest" ]; then
+    api_url="${SMOS_GITHUB_API}/repos/${SMOS_REPO}/releases/latest"
+  else
+    api_url="${SMOS_GITHUB_API}/repos/${SMOS_REPO}/releases/tags/${SMOS_VERSION}"
   fi
-  export PATH="${HOME}/.cargo/bin:${PATH}"
-  need_cmd cargo
-  need_cmd rustc
-  log "rust installed: $(rustc --version)"
-}
 
-obtain_source() {
-  if [ -n "$SMOS_SRC_DIR" ]; then
-    [ -d "$SMOS_SRC_DIR" ] || die "SMOS_SRC_DIR not a directory: $SMOS_SRC_DIR"
-    [ -f "$SMOS_SRC_DIR/Cargo.toml" ] || die "SMOS_SRC_DIR missing Cargo.toml: $SMOS_SRC_DIR"
-    BUILD_SRC="$SMOS_SRC_DIR"
-    log "using existing source at $BUILD_SRC"
-    return 0
-  fi
-  if [ -n "$SMOS_BUILD_DIR" ]; then
-    BUILD_SRC="$SMOS_BUILD_DIR"
+  log "fetching release metadata: ${api_url}"
+  json="$(curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "${api_url}")" || die "failed to query GitHub releases (create a release tag v* first, or set SMOS_VERSION)"
+
+  # Prefer python for JSON if present; else grep/sed best-effort.
+  ASSET_URL=""
+  ASSET_NAME=""
+  RELEASE_TAG=""
+  if command -v python3 >/dev/null 2>&1; then
+    # Export target for the parser process
+    parsed="$(
+      SMOS_TARGET="$SMOS_TARGET" printf '%s' "$json" | SMOS_TARGET="$SMOS_TARGET" python3 -c '
+import json, sys, os
+target = os.environ.get("SMOS_TARGET", "")
+data = json.load(sys.stdin)
+print("RELEASE_TAG=" + repr(data.get("tag_name") or ""))
+want = "-" + target + ".tar.gz"
+url = ""
+name = ""
+for a in data.get("assets") or []:
+    n = a.get("name") or ""
+    if n.endswith(want) or (target and target in n and n.endswith(".tar.gz") and not n.endswith(".sha256")):
+        url = a.get("browser_download_url") or ""
+        name = n
+        break
+if not url:
+    for a in data.get("assets") or []:
+        n = a.get("name") or ""
+        if n.startswith("smos-") and n.endswith(".tar.gz") and not n.endswith(".sha256"):
+            url = a.get("browser_download_url") or ""
+            name = n
+            break
+print("ASSET_URL=" + repr(url))
+print("ASSET_NAME=" + repr(name))
+'
+    )"
+    eval "$parsed"
   else
-    BUILD_SRC="$(mktemp -d "${TMPDIR:-/tmp}/smos-src.XXXXXX")"
-    CLEANUP_SRC=1
-  fi
-  log "cloning ${SMOS_REPO}@${SMOS_REF} into $BUILD_SRC"
-  if [ -d "$BUILD_SRC/.git" ]; then
-    git -C "$BUILD_SRC" fetch --depth 1 origin "$SMOS_REF"
-    git -C "$BUILD_SRC" checkout -q FETCH_HEAD || git -C "$BUILD_SRC" checkout -q "$SMOS_REF"
-  else
-    mkdir -p "$BUILD_SRC"
-    git clone --depth 1 --branch "$SMOS_REF" "$SMOS_REPO" "$BUILD_SRC" \
-      || git clone --depth 1 "$SMOS_REPO" "$BUILD_SRC"
-    if [ ! -f "$BUILD_SRC/Cargo.toml" ]; then
-      die "clone did not produce Cargo.toml in $BUILD_SRC"
+    RELEASE_TAG="$(printf '%s' "$json" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    ASSET_URL="$(printf '%s' "$json" | grep -oE 'https://github.com/[^"]+/releases/download/[^"]+\.tar\.gz' | grep "${SMOS_TARGET}" | grep -v sha256 | head -n1 || true)"
+    if [ -z "$ASSET_URL" ]; then
+      ASSET_URL="$(printf '%s' "$json" | grep -oE 'https://github.com/[^"]+/releases/download/[^"]+\.tar\.gz' | grep -v sha256 | head -n1 || true)"
     fi
+    ASSET_NAME="$(basename "$ASSET_URL" 2>/dev/null || true)"
   fi
-  [ -f "$BUILD_SRC/Cargo.toml" ] || die "source tree incomplete: $BUILD_SRC"
+
+  [ -n "$ASSET_URL" ] || die "no release tarball found for target ${SMOS_TARGET} in ${SMOS_REPO} (${SMOS_VERSION}). Publish a release first (git tag vX.Y.Z && git push --tags)."
+  log "release=${RELEASE_TAG:-$SMOS_VERSION} asset=${ASSET_NAME:-unknown}"
+  log "download ${ASSET_URL}"
 }
 
-build_binary() {
-  if [ "$SMOS_SKIP_BUILD" = "1" ]; then
-    [ -n "$SMOS_BIN_SRC" ] || die "SMOS_SKIP_BUILD=1 requires SMOS_BIN_SRC"
-    [ -f "$SMOS_BIN_SRC" ] || die "SMOS_BIN_SRC not found: $SMOS_BIN_SRC"
-    BUILT_BIN="$SMOS_BIN_SRC"
-    log "using prebuilt binary $BUILT_BIN"
-    return 0
+download_and_extract() {
+  WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/smos-install.XXXXXX")"
+  local tar_path="${WORK_DIR}/smos.tgz"
+  log "downloading to ${tar_path}"
+  curl -fsSL -L -o "$tar_path" "$ASSET_URL" || die "download failed"
+
+  log "extracting"
+  tar -C "$WORK_DIR" -xzf "$tar_path"
+
+  # Find binary: either staged dir smos-VER-target/smos or flat smos
+  EXTRACTED_BIN=""
+  EXTRACTED_STATIC=""
+  if [ -x "${WORK_DIR}/smos" ] && [ ! -d "${WORK_DIR}/smos" ]; then
+    EXTRACTED_BIN="${WORK_DIR}/smos"
   fi
-  need_cmd cargo
-  log "building release binary (this may take a few minutes)"
-  (
-    cd "$BUILD_SRC"
-    # Prefer cargo from rustup path
-    export PATH="${HOME}/.cargo/bin:${PATH}"
-    cargo build --release
-  )
-  BUILT_BIN="$BUILD_SRC/target/release/smos"
-  [ -x "$BUILT_BIN" ] || die "build failed: missing $BUILT_BIN"
-  log "built $BUILT_BIN"
+  # shellcheck disable=SC2044
+  for f in $(find "$WORK_DIR" -type f -name smos 2>/dev/null); do
+    if [ -x "$f" ] || [ -f "$f" ]; then
+      EXTRACTED_BIN="$f"
+      break
+    fi
+  done
+  [ -n "$EXTRACTED_BIN" ] || die "tarball missing smos binary"
+  chmod +x "$EXTRACTED_BIN" || true
+
+  local parent
+  parent="$(dirname "$EXTRACTED_BIN")"
+  if [ -d "${parent}/static" ]; then
+    EXTRACTED_STATIC="${parent}/static"
+  elif [ -d "${WORK_DIR}/static" ]; then
+    EXTRACTED_STATIC="${WORK_DIR}/static"
+  else
+    # search
+    EXTRACTED_STATIC="$(find "$WORK_DIR" -type d -name static | head -n1 || true)"
+  fi
+  [ -n "$EXTRACTED_STATIC" ] && [ -d "$EXTRACTED_STATIC" ] || die "tarball missing static/ WebUI assets"
+  log "binary=${EXTRACTED_BIN}"
+  log "static=${EXTRACTED_STATIC}"
 }
 
 install_files() {
-  log "installing to $SMOS_PREFIX (data: $SMOS_DATA_DIR)"
+  log "installing to ${SMOS_PREFIX} (data: ${SMOS_DATA_DIR})"
   run_as_root mkdir -p "$SMOS_PREFIX" "$SMOS_DATA_DIR"
-  run_as_root cp "$BUILT_BIN" "$SMOS_PREFIX/smos"
-  run_as_root chmod 755 "$SMOS_PREFIX/smos"
+  run_as_root cp "$EXTRACTED_BIN" "${SMOS_PREFIX}/smos"
+  run_as_root chmod 755 "${SMOS_PREFIX}/smos"
+  run_as_root rm -rf "${SMOS_PREFIX}/static"
+  run_as_root cp -a "$EXTRACTED_STATIC" "${SMOS_PREFIX}/static"
 
-  STATIC_SRC=""
-  if [ -d "$BUILD_SRC/static" ]; then
-    STATIC_SRC="$BUILD_SRC/static"
-  elif [ -n "${SMOS_STATIC_SRC:-}" ] && [ -d "$SMOS_STATIC_SRC" ]; then
-    STATIC_SRC="$SMOS_STATIC_SRC"
-  fi
-  if [ -n "$STATIC_SRC" ]; then
-    run_as_root rm -rf "$SMOS_PREFIX/static"
-    run_as_root cp -a "$STATIC_SRC" "$SMOS_PREFIX/static"
-    log "installed WebUI assets from $STATIC_SRC"
-  else
-    die "static WebUI assets not found next to source"
-  fi
-
-  # Optional service user (best-effort)
   if ! id -u "$SMOS_USER" >/dev/null 2>&1; then
     if command -v useradd >/dev/null 2>&1; then
       run_as_root useradd -r -s /usr/sbin/nologin "$SMOS_USER" 2>/dev/null \
         || run_as_root useradd -r -s /bin/false "$SMOS_USER" 2>/dev/null \
-        || log "could not create user $SMOS_USER; service may run as root"
+        || log "could not create user ${SMOS_USER}"
     fi
   fi
   if id -u "$SMOS_USER" >/dev/null 2>&1; then
@@ -187,7 +220,7 @@ install_files() {
 write_env_file() {
   local env_file="${SMOS_ENV_FILE:-/etc/smos.env}"
   if [ -f "$env_file" ]; then
-    log "keeping existing env file $env_file"
+    log "keeping existing env file ${env_file}"
     return 0
   fi
   local token
@@ -195,7 +228,7 @@ write_env_file() {
   if [ -z "$token" ]; then
     token="change-me-$(date +%s)"
   fi
-  log "writing $env_file"
+  log "writing ${env_file}"
   run_as_root tee "$env_file" >/dev/null <<EOF
 SMOS_AUTH_TOKEN=${token}
 RUST_LOG=info
@@ -218,7 +251,7 @@ install_systemd() {
   if id -u "$SMOS_USER" >/dev/null 2>&1; then
     run_user="$SMOS_USER"
   fi
-  log "installing systemd unit $unit (User=$run_user)"
+  log "installing systemd unit ${unit} (User=${run_user})"
   run_as_root tee "$unit" >/dev/null <<EOF
 [Unit]
 Description=SMOS Server Management OS
@@ -243,24 +276,18 @@ EOF
 }
 
 smoke_check() {
-  local bin="$SMOS_PREFIX/smos"
-  [ -x "$bin" ] || die "installed binary missing: $bin"
-  if "$bin" --help >/dev/null 2>&1 || "$bin" -h >/dev/null 2>&1; then
-    log "smoke: $bin --help ok"
-  else
-    # Binary may not support --help; try version via running health if service up
-    log "smoke: binary present at $bin"
-  fi
+  local bin="${SMOS_PREFIX}/smos"
+  [ -x "$bin" ] || die "installed binary missing: ${bin}"
+  log "smoke: binary present at ${bin}"
   if [ "$SMOS_SKIP_SERVICE" != "1" ] && command -v curl >/dev/null 2>&1; then
     local host port
     host="${SMOS_BIND%:*}"
     port="${SMOS_BIND##*:}"
-    # localhost bind may use 127.0.0.1
     sleep 1
     if curl -fsS --max-time 3 "http://${host}:${port}/api/health" >/dev/null 2>&1; then
-      log "smoke: health endpoint ok at http://${host}:${port}/api/health"
+      log "smoke: health ok http://${host}:${port}/api/health"
     else
-      log "smoke: health not reachable yet (service may need a moment); try: curl http://${host}:${port}/api/health"
+      log "smoke: health not ready yet — try: curl http://${host}:${port}/api/health"
     fi
   fi
 }
@@ -268,55 +295,73 @@ smoke_check() {
 print_done() {
   cat <<EOF
 
-SMOS installed.
+SMOS installed from GitHub Release (prebuilt).
 
   Binary:   ${SMOS_PREFIX}/smos
   WebUI:    ${SMOS_PREFIX}/static
   Data:     ${SMOS_DATA_DIR}
   Bind:     ${SMOS_BIND}
+  Version:  ${RELEASE_TAG:-$SMOS_VERSION}
 
   Dashboard: http://${SMOS_BIND}/
   Health:    http://${SMOS_BIND}/api/health
-
   Service:   systemctl status smos
-  Logs:      journalctl -u smos -f
 
-One-liner reinstall:
-  curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/${SMOS_REF}/scripts/install.sh | bash
+Reinstall / upgrade:
+  curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | bash
+
+Pin a version:
+  curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | SMOS_VERSION=v0.1.0 bash
 
 EOF
 }
 
+# Optional slow path if no release exists and operator opts in.
+install_from_source() {
+  log "SMOS_FROM_SOURCE=1 — building on this machine (requires rustc/cargo)"
+  need_cmd git
+  if ! command -v cargo >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    # shellcheck source=/dev/null
+    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+    export PATH="${HOME}/.cargo/bin:${PATH}"
+  fi
+  need_cmd cargo
+  WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/smos-src.XXXXXX")"
+  git clone --depth 1 "https://github.com/${SMOS_REPO}.git" "$WORK_DIR"
+  (cd "$WORK_DIR" && cargo build --release)
+  EXTRACTED_BIN="${WORK_DIR}/target/release/smos"
+  EXTRACTED_STATIC="${WORK_DIR}/static"
+  [ -x "$EXTRACTED_BIN" ] || die "source build failed"
+}
+
 cleanup() {
-  if [ "${CLEANUP_SRC:-0}" = "1" ] && [ -n "${BUILD_SRC:-}" ] && [ -d "$BUILD_SRC" ]; then
-    # Keep build dir on failure for debugging if SMOS_KEEP_SRC=1
-    if [ "${SMOS_KEEP_SRC:-0}" != "1" ]; then
-      rm -rf "$BUILD_SRC" || true
-    fi
+  if [ -n "${WORK_DIR:-}" ] && [ -d "${WORK_DIR:-}" ]; then
+    rm -rf "$WORK_DIR" || true
   fi
 }
 
 main() {
-  CLEANUP_SRC=0
-  BUILD_SRC=""
-  BUILT_BIN=""
+  WORK_DIR=""
+  ASSET_URL=""
+  ASSET_NAME=""
+  RELEASE_TAG=""
+  EXTRACTED_BIN=""
+  EXTRACTED_STATIC=""
   trap cleanup EXIT
 
-  log "SMOS installer starting (ref=${SMOS_REF})"
+  log "SMOS installer (release download) starting"
   detect_os
-  install_deps
-  if [ "$SMOS_SKIP_BUILD" != "1" ]; then
-    ensure_rust
-    obtain_source
+  detect_target
+  install_runtime_deps
+
+  if [ "$SMOS_FROM_SOURCE" = "1" ]; then
+    install_from_source
   else
-    # still need static assets
-    if [ -z "$SMOS_SRC_DIR" ] && [ -z "${SMOS_STATIC_SRC:-}" ]; then
-      obtain_source
-    elif [ -n "$SMOS_SRC_DIR" ]; then
-      BUILD_SRC="$SMOS_SRC_DIR"
-    fi
+    resolve_asset_url
+    download_and_extract
   fi
-  build_binary
+
   install_files
   install_systemd
   smoke_check

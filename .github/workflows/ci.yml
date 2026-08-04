@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: ["**"]
+    tags-ignore:
+      - "v*"
   pull_request:
     branches: ["**"]
 
@@ -28,3 +30,6 @@ jobs:
 
       - name: Test
         run: cargo test --verbose
+
+      - name: Install script syntax
+        run: bash -n scripts/install.sh

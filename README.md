@@ -52,47 +52,56 @@ Open the dashboard: **http://127.0.0.1:9090/** (or your bind address).
 
 ## Install (one command)
 
-On a Linux VPS (Ubuntu/Debian recommended), install and start SMOS with a single command:
+On a Linux VPS, install the **prebuilt** binary from **GitHub Releases** (no compile on the server):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | bash
 ```
 
-That script (from this GitHub repo) will:
+What it does:
 
-1. Install build dependencies (apt/dnf when available)
-2. Install Rust via rustup if needed
-3. Clone and `cargo build --release` from `https://github.com/vantanminh/SMOS.git`
-4. Install binary + WebUI to `/opt/smos` and data dir `/var/lib/smos`
-5. Enable and start a `systemd` service (`smos`) bound to `127.0.0.1:9090`
-
-After install:
+1. Installs only runtime tools (`curl`, `tar`, CA certs)
+2. Detects CPU arch (`x86_64` / `aarch64`)
+3. Downloads the matching tarball from [GitHub Releases](https://github.com/vantanminh/SMOS/releases)
+4. Installs binary + WebUI to `/opt/smos`, data to `/var/lib/smos`
+5. Enables and starts systemd unit `smos` on `127.0.0.1:9090`
 
 ```bash
 curl -sS http://127.0.0.1:9090/api/health
-# Dashboard: http://127.0.0.1:9090/  (or SSH tunnel / reverse proxy)
 systemctl status smos
+# Dashboard: http://127.0.0.1:9090/
 ```
-
-Optional environment variables before/with the pipe:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SMOS_REF` | `main` | Git branch/tag to install |
-| `SMOS_BIND` | `127.0.0.1:9090` | HTTP bind address |
+| `SMOS_VERSION` | `latest` | Release tag, e.g. `v0.1.0` |
+| `SMOS_BIND` | `127.0.0.1:9090` | HTTP bind |
 | `SMOS_PREFIX` | `/opt/smos` | Install prefix |
-| `SMOS_DATA_DIR` | `/var/lib/smos` | Config, audit, logs |
-| `SMOS_SKIP_SERVICE` | `0` | Set `1` to skip systemd |
-| `SMOS_SKIP_DEPS` | `0` | Set `1` to skip apt/dnf |
+| `SMOS_DATA_DIR` | `/var/lib/smos` | Config / audit / logs |
+| `SMOS_SKIP_SERVICE` | `0` | `1` = skip systemd |
+| `SMOS_FROM_SOURCE` | `0` | `1` = clone + cargo build (slow fallback) |
 
-Example (custom bind, no systemd):
+Pin a version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | \
-  SMOS_BIND=0.0.0.0:9090 SMOS_SKIP_SERVICE=1 bash
+curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | SMOS_VERSION=v0.1.0 bash
 ```
 
-> **Trust note:** `curl | bash` runs remote code. Prefer pinning a tag (`SMOS_REF=v0.1.0`) once you publish releases, or review [`scripts/install.sh`](scripts/install.sh) first.
+### Publish a release (maintainers)
+
+CI builds Linux artifacts and attaches them to a GitHub Release when you push a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+# → Actions workflow "Release" → github.com/vantanminh/SMOS/releases
+```
+
+Asset name pattern: `smos-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` (binary + `static/`).
+
+You can also run the **Release** workflow manually (`workflow_dispatch`) with a tag input.
+
+> **Trust note:** `curl | bash` runs remote code. Review [`scripts/install.sh`](scripts/install.sh) or pin `SMOS_VERSION`.
 
 ## Install on Ubuntu server (manual steps)
 

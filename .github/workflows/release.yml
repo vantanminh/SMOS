@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/publish (e.g. v0.1.0). Leave empty to use run id draft name."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build Linux release assets
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os_name: linux-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }} --locked
+
+      - name: Package tarball
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VER="${{ github.ref_name }}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            VER="${{ inputs.tag }}"
+          else
+            VER="v0.0.0-dev.${{ github.run_number }}"
+          fi
+          # strip leading v for inner version file optional
+          STAGE="smos-${VER}-${TARGET}"
+          mkdir -p "dist/${STAGE}"
+          cp "target/${TARGET}/release/smos" "dist/${STAGE}/smos"
+          chmod 755 "dist/${STAGE}/smos"
+          cp -a static "dist/${STAGE}/static"
+          # checksum of binary for install verification
+          (cd "dist/${STAGE}" && sha256sum smos > smos.sha256)
+          TAR_NAME="${STAGE}.tar.gz"
+          tar -C dist -czf "${TAR_NAME}" "${STAGE}"
+          sha256sum "${TAR_NAME}" > "${TAR_NAME}.sha256"
+          echo "tar_name=${TAR_NAME}" >> "$GITHUB_OUTPUT"
+          echo "ver=${VER}" >> "$GITHUB_OUTPUT"
+          ls -la "${TAR_NAME}" "${TAR_NAME}.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smos-${{ matrix.target }}
+          path: |
+            smos-*.tar.gz
+            smos-*.tar.gz.sha256
+
+  publish:
+    name: Publish GitHub Release
+    needs: build-linux
+    runs-on: ubuntu-latest
+    # Tag pushes always publish; workflow_dispatch publishes when tag input set
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    steps:
+      - name: Download assets
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: List assets
+        run: find assets -type f -ls || ls -laR assets
+
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: SMOS ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: |
+            assets/*.tar.gz
+            assets/*.sha256
+            assets/**/*.tar.gz
+            assets/**/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

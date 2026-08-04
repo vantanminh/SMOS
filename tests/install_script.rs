@@ -1,5 +1,4 @@
-//! Structural checks for the shipped one-line install script + README one-liner.
-//! These tests read the real files from the repo (not re-implementations).
+//! Structural checks for the shipped release-based install script + README one-liner.
 
 use std::fs;
 use std::path::PathBuf;
@@ -13,18 +12,15 @@ fn install_script_path() -> PathBuf {
     repo_root().join("scripts/install.sh")
 }
 
+fn release_workflow_path() -> PathBuf {
+    repo_root().join(".github/workflows/release.yml")
+}
+
 fn read_install_script() -> String {
     let path = install_script_path();
-    assert!(
-        path.is_file(),
-        "install script must exist at {}",
-        path.display()
-    );
+    assert!(path.is_file(), "install script must exist at {}", path.display());
     let body = fs::read_to_string(&path).expect("read install.sh");
-    assert!(
-        body.trim().len() > 200,
-        "install.sh must not be empty/stub"
-    );
+    assert!(body.trim().len() > 200, "install.sh must not be empty/stub");
     body
 }
 
@@ -43,37 +39,50 @@ fn install_script_is_shell_with_shebang() {
 }
 
 #[test]
-fn install_script_automates_full_install_phases() {
+fn install_script_downloads_github_release_not_server_build_by_default() {
     let body = read_install_script();
-    let phases: &[(&str, &[&str])] = &[
-        (
-            "deps",
-            &["apt-get", "build-essential", "install_deps"],
-        ),
-        ("rust", &["rustup", "ensure_rust", "cargo"]),
-        (
-            "source_or_clone",
-            &["git clone", "obtain_source", "SMOS_REPO"],
-        ),
-        (
-            "build",
-            &["cargo build --release", "build_binary"],
-        ),
-        (
-            "place_binary_and_static",
-            &["install_files", "static", "SMOS_PREFIX"],
-        ),
-        (
-            "service_or_run",
-            &["systemd", "install_systemd", "systemctl"],
-        ),
-    ];
-    for (name, needles) in phases {
-        let ok = needles.iter().any(|n| body.contains(n));
+    // Primary path: GitHub Releases API + tarball download
+    assert!(
+        body.contains("api.github.com") || body.contains("releases/latest") || body.contains("/releases/"),
+        "install.sh must query GitHub Releases"
+    );
+    assert!(
+        body.contains("browser_download_url")
+            || body.contains("ASSET_URL")
+            || body.contains("resolve_asset_url"),
+        "install.sh must resolve a release asset URL"
+    );
+    assert!(
+        body.contains("curl") && (body.contains("tar ") || body.contains("tar -")),
+        "install.sh must download and extract a tarball"
+    );
+    // Default path must NOT require cargo build on the server
+    assert!(
+        !body.contains("cargo build --release")
+            || body.contains("SMOS_FROM_SOURCE"),
+        "cargo build should only be optional fallback"
+    );
+    // When FROM_SOURCE appears, it must be gated
+    if body.contains("cargo build --release") {
         assert!(
-            ok,
-            "install.sh missing phase '{name}' (looked for one of {needles:?})"
+            body.contains("SMOS_FROM_SOURCE"),
+            "source build must be behind SMOS_FROM_SOURCE"
         );
+    }
+}
+
+#[test]
+fn install_script_automates_place_and_service() {
+    let body = read_install_script();
+    for needle in [
+        "SMOS_PREFIX",
+        "static",
+        "install_files",
+        "systemd",
+        "systemctl",
+        "install_systemd",
+    ] {
+        assert!(body.contains(needle), "missing phase marker: {needle}");
     }
 }
 
@@ -81,9 +90,8 @@ fn install_script_automates_full_install_phases() {
 fn install_script_documents_github_raw_usage() {
     let body = read_install_script();
     assert!(
-        body.contains("raw.githubusercontent.com/vantanminh/SMOS")
-            || body.contains("curl -fsSL"),
-        "script should document curl|bash / raw GitHub usage"
+        body.contains("raw.githubusercontent.com/vantanminh/SMOS") || body.contains("curl -fsSL"),
+        "script should document curl|bash usage"
     );
     assert!(
         body.contains("vantanminh/SMOS"),
@@ -92,30 +100,60 @@ fn install_script_documents_github_raw_usage() {
 }
 
 #[test]
-fn readme_documents_curl_bash_oneliner() {
+fn release_workflow_builds_and_publishes_assets() {
+    let path = release_workflow_path();
+    assert!(path.is_file(), "missing {}", path.display());
+    let body = fs::read_to_string(&path).expect("read release.yml");
+    assert!(
+        body.contains("tags:") || body.contains("v*"),
+        "release workflow should trigger on version tags"
+    );
+    assert!(
+        body.contains("cargo build --release"),
+        "release workflow must cargo build --release"
+    );
+    assert!(
+        body.contains("tar") || body.contains(".tar.gz"),
+        "release workflow must package tar.gz assets"
+    );
+    assert!(
+        body.contains("action-gh-release")
+            || body.contains("softprops/action-gh-release")
+            || body.contains("upload-release-asset")
+            || body.contains("gh release"),
+        "release workflow must publish a GitHub Release"
+    );
+    assert!(
+        body.contains("static"),
+        "release package must include static WebUI assets"
+    );
+}
+
+#[test]
+fn readme_documents_curl_bash_oneliner_and_release_flow() {
     let readme = fs::read_to_string(repo_root().join("README.md")).expect("README");
     assert!(
-        readme.contains("curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh"),
-        "README must document the exact raw GitHub one-liner URL"
+        readme.contains(
+            "curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh"
+        ),
+        "README must document the raw GitHub one-liner URL"
     );
     assert!(
         readme.contains("| bash") || readme.contains("|bash"),
         "README one-liner must pipe to bash"
     );
-    // URL path must match in-repo script
     assert!(
-        install_script_path().ends_with("scripts/install.sh"),
-        "script path must stay scripts/install.sh for raw URL stability"
+        readme.to_lowercase().contains("release")
+            || readme.contains("prebuilt")
+            || readme.contains("GitHub Release"),
+        "README should mention prebuilt/release install"
     );
 }
 
 #[test]
 fn bash_syntax_check_when_available() {
     let path = install_script_path();
-    // Try bash, then sh -n (sh -n is weaker but better than nothing)
-    let candidates = ["bash", "sh"];
-    let mut ran = false;
-    for shell in candidates {
+    for shell in ["bash", "sh"] {
         let which = Command::new(shell).arg("-c").arg("echo ok").output();
         if which.map(|o| o.status.success()).unwrap_or(false) {
             let out = Command::new(shell)
@@ -125,16 +163,11 @@ fn bash_syntax_check_when_available() {
                 .unwrap_or_else(|e| panic!("failed to spawn {shell}: {e}"));
             assert!(
                 out.status.success(),
-                "{shell} -n failed:\nstdout={}\nstderr={}",
-                String::from_utf8_lossy(&out.stdout),
+                "{shell} -n failed:\n{}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            ran = true;
-            break;
+            return;
         }
     }
-    if !ran {
-        // Windows without bash: structural tests above still gate content.
-        eprintln!("bash/sh not available; skipped bash -n (structural tests cover content)");
-    }
+    eprintln!("bash/sh not available; skipped bash -n");
 }
