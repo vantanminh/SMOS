@@ -223,13 +223,34 @@ async fn process_self_action_blocked() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
+/// Spawn a long-lived child for kill tests (Linux CI + Windows).
+fn spawn_sleep_child() -> std::process::Child {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 120"])
+            .spawn()
+            .expect("spawn sleep child (powershell)")
+    }
+    #[cfg(not(windows))]
+    {
+        // Prefer `sleep` from coreutils; fall back to `sh -c`.
+        std::process::Command::new("sleep")
+            .arg("120")
+            .spawn()
+            .or_else(|_| {
+                std::process::Command::new("sh")
+                    .args(["-c", "sleep 120"])
+                    .spawn()
+            })
+            .expect("spawn sleep child (sleep/sh)")
+    }
+}
+
 #[tokio::test]
 async fn process_kill_child_end_to_end() {
     // Spawn a long-sleep child, kill it through the real process module API.
-    let mut child = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 120"])
-        .spawn()
-        .expect("spawn sleep child");
+    let mut child = spawn_sleep_child();
     let pid = child.id();
     let result = smos::processes::act_on_process(pid, smos::processes::ProcessAction::Kill);
     match result {
