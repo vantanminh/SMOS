@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SMOS — Server Management OS</title>
+  <link rel="stylesheet" href="/assets/style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">S</div>
+        <div>
+          <div class="brand-title">SMOS</div>
+          <div class="brand-sub" id="host-label">loading…</div>
+        </div>
+      </div>
+      <nav class="nav" id="nav">
+        <a href="#/overview" data-route="overview" class="nav-item active">Overview</a>
+        <a href="#/metrics" data-route="metrics" class="nav-item">Metrics</a>
+        <a href="#/processes" data-route="processes" class="nav-item">Processes</a>
+        <a href="#/logs" data-route="logs" class="nav-item">Logs</a>
+        <a href="#/config" data-route="config" class="nav-item">Config</a>
+        <a href="#/audit" data-route="audit" class="nav-item">Audit</a>
+      </nav>
+      <div class="sidebar-foot">
+        <div id="health-pill" class="pill">connecting</div>
+        <div class="muted" id="version"></div>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <h1 id="page-title">Overview</h1>
+        <div class="topbar-actions">
+          <label class="token-field">
+            <span>Token</span>
+            <input id="auth-token" type="password" placeholder="optional API token" autocomplete="off" />
+          </label>
+          <button id="refresh-btn" class="btn">Refresh</button>
+        </div>
+      </header>
+      <section id="view" class="view"></section>
+    </main>
+  </div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
