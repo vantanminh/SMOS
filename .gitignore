@@ -5,3 +5,16 @@
 harness.db
 harness.db-wal
 harness.db-shm
+
+# Rust
+/target/
+
+# Local goal-loop working notes (never commit)
+/IMPLEMENTATION_NOTES.md
+
+# Runtime data / env
+/smos-data/
+.env
+*.log
+.DS_Store
+
