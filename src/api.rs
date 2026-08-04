@@ -6,7 +6,9 @@ use crate::config::{ConfigUpdate, PublicConfig, SmosConfig};
 use crate::history::{self, HistoryStatus, MetricsHistoryResponse};
 use crate::logs::{self, LogSourceInfo, LogTail, SERVICE_LOG_ID};
 use crate::metrics::{self, MetricsSnapshot};
-use crate::processes::{self, ProcessActionRequest, ProcessActionResult, ProcessInfo};
+use crate::processes::{
+    self, ProcessActionRequest, ProcessActionResult, ProcessInfo, ProcessQuery,
+};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
@@ -610,10 +612,10 @@ async fn get_history_status(
         })
 }
 
-async fn get_processes() -> Json<Vec<ProcessInfo>> {
-    let list = tokio::task::spawn_blocking(processes::list_processes)
+async fn get_processes(Query(q): Query<ProcessQuery>) -> Json<Vec<ProcessInfo>> {
+    let list = tokio::task::spawn_blocking(move || processes::query_processes(&q))
         .await
-        .unwrap_or_else(|_| processes::list_processes());
+        .unwrap_or_else(|_| processes::query_processes(&ProcessQuery::default()));
     Json(list)
 }
 

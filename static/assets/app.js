@@ -12,9 +12,11 @@
     historyRangeHours: 24,
     historyStatus: null,
     processes: [],
+    processFilter: { name: "", sort: "cpu", order: "desc" },
     logs: [],
     logTail: null,
     config: null,
+    alerts: null,
     audit: [],
     cpuHistory: [],
     memHistory: [],
@@ -562,6 +564,7 @@
   }
 
   function renderProcesses() {
+    const f = state.processFilter || { name: "", sort: "cpu", order: "desc" };
     const list = (state.processes || []).slice(0, 150);
     const rows = list.map(p => `
       <tr>
@@ -597,16 +600,33 @@
         </div>
       </article>
     `).join("");
+    const sortOpts = ["cpu", "memory", "name", "pid"].map(s =>
+      `<option value="${s}" ${f.sort === s ? "selected" : ""}>${s}</option>`
+    ).join("");
     return `
       <div class="grid">
         <div class="card full">
           <h3>Running processes (${state.processes.length})</h3>
-          <p class="muted">Terminate is graceful; Kill forces exit. Self-process actions are blocked.</p>
-          <div class="proc-list">${cards || '<div class="empty">No processes</div>'}</div>
+          <p class="muted">Search and sort run on the server. Terminate is graceful; Kill forces exit. Self-process actions are blocked.</p>
+          <form id="proc-filter-form" class="log-toolbar proc-filter" style="flex-wrap:wrap;gap:0.5rem;margin:0.75rem 0">
+            <label class="muted">Name <input id="proc-name" name="name" type="search" placeholder="filter by name…" value="${esc(f.name || "")}" style="min-width:10rem" /></label>
+            <label class="muted">Sort
+              <select id="proc-sort" name="sort">${sortOpts}</select>
+            </label>
+            <label class="muted">Order
+              <select id="proc-order" name="order">
+                <option value="desc" ${f.order === "desc" ? "selected" : ""}>desc</option>
+                <option value="asc" ${f.order === "asc" ? "selected" : ""}>asc</option>
+              </select>
+            </label>
+            <button class="btn" type="submit">Apply</button>
+            <button class="btn secondary" type="button" id="proc-clear">Clear</button>
+          </form>
+          <div class="proc-list">${cards || '<div class="empty">No processes match</div>'}</div>
           <div class="table-wrap proc-table-wrap" style="max-height:70vh;overflow:auto">
             <table>
               <thead><tr><th>PID</th><th>Name</th><th>CPU</th><th>Mem</th><th>Status</th><th>Actions</th></tr></thead>
-              <tbody>${rows || '<tr><td colspan="6" class="empty">No processes</td></tr>'}</tbody>
+              <tbody>${rows || '<tr><td colspan="6" class="empty">No processes match</td></tr>'}</tbody>
             </table>
           </div>
         </div>
@@ -793,6 +813,36 @@
       });
     });
 
+    const procForm = $("#proc-filter-form");
+    if (procForm) {
+      procForm.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        state.processFilter = {
+          name: ($("#proc-name")?.value || "").trim(),
+          sort: $("#proc-sort")?.value || "cpu",
+          order: $("#proc-order")?.value || "desc",
+        };
+        try {
+          await loadProcesses();
+          render();
+        } catch (e) {
+          alert(e.message);
+        }
+      });
+    }
+    const procClear = $("#proc-clear");
+    if (procClear) {
+      procClear.addEventListener("click", async () => {
+        state.processFilter = { name: "", sort: "cpu", order: "desc" };
+        try {
+          await loadProcesses();
+          render();
+        } catch (e) {
+          alert(e.message);
+        }
+      });
+    }
+
     const form = $("#config-form");
     if (form) {
       form.addEventListener("submit", async (ev) => {
@@ -908,7 +958,14 @@
   }
 
   async function loadProcesses() {
-    state.processes = await api("/processes");
+    const f = state.processFilter || { name: "", sort: "cpu", order: "desc" };
+    const params = new URLSearchParams();
+    if (f.name && f.name.trim()) params.set("name", f.name.trim());
+    if (f.sort) params.set("sort", f.sort);
+    if (f.order) params.set("order", f.order);
+    params.set("limit", "200");
+    const q = params.toString();
+    state.processes = await api("/processes" + (q ? "?" + q : ""));
   }
 
   async function loadLogs() {
