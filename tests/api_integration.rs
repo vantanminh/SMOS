@@ -121,8 +121,19 @@ async fn invalid_config_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let state = test_state(dir.path());
     let app = api::router(state, resolve_static_dir());
-    let body = serde_json::json!({ "log_tail_lines": 0 });
+
+    let (st, before) = json_get(&app, "/api/config").await;
+    assert_eq!(st, StatusCode::OK);
+    let label_before = before["host_label"].as_str().unwrap().to_string();
+    let lines_before = before["log_tail_lines"].as_u64().unwrap();
+
+    // Invalid update mixes a would-be mutation with a hard validation failure.
+    let body = serde_json::json!({
+        "host_label": "should-not-stick",
+        "log_tail_lines": 0
+    });
     let res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("PUT")
@@ -134,6 +145,21 @@ async fn invalid_config_rejected() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Read-after-reject: criterion 5 — invalid updates must not apply.
+    let (st, after) = json_get(&app, "/api/config").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        after["host_label"].as_str().unwrap(),
+        label_before,
+        "host_label must remain unchanged after rejected PUT"
+    );
+    assert_eq!(
+        after["log_tail_lines"].as_u64().unwrap(),
+        lines_before,
+        "log_tail_lines must remain unchanged after rejected PUT"
+    );
+    assert_ne!(after["host_label"], "should-not-stick");
 }
 
 #[tokio::test]

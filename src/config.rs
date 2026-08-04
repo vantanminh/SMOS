@@ -186,26 +186,29 @@ impl SmosConfig {
         Ok(())
     }
 
+    /// Apply a partial update atomically: on validation failure, `self` is unchanged.
     pub fn apply_update(&mut self, update: ConfigUpdate) -> Result<()> {
+        let mut next = self.clone();
         if let Some(bind) = update.bind {
-            self.bind = bind;
+            next.bind = bind;
         }
         if let Some(token) = update.auth_token {
-            self.auth_token = token;
+            next.auth_token = token;
         }
         if let Some(n) = update.log_tail_lines {
-            self.log_tail_lines = n;
+            next.log_tail_lines = n;
         }
         if let Some(label) = update.host_label {
-            self.host_label = label;
+            next.host_label = label;
         }
         if let Some(secs) = update.metrics_poll_secs {
-            self.metrics_poll_secs = secs;
+            next.metrics_poll_secs = secs;
         }
         if let Some(sources) = update.log_sources {
-            self.log_sources = sources;
+            next.log_sources = sources;
         }
-        self.validate()?;
+        next.validate()?;
+        *self = next;
         Ok(())
     }
 
@@ -282,5 +285,29 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("log_tail_lines"));
+    }
+
+    #[test]
+    fn apply_update_is_atomic_on_validation_failure() {
+        let mut cfg = SmosConfig::default();
+        let before = cfg.clone();
+        cfg.host_label = "original-label".into();
+        cfg.log_tail_lines = 200;
+        let snapshot = cfg.clone();
+
+        let err = cfg
+            .apply_update(ConfigUpdate {
+                host_label: Some("would-be-changed".into()),
+                log_tail_lines: Some(0), // invalid
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("log_tail_lines"));
+        // No field from the rejected update may stick.
+        assert_eq!(cfg.host_label, snapshot.host_label);
+        assert_eq!(cfg.log_tail_lines, snapshot.log_tail_lines);
+        assert_eq!(cfg, snapshot);
+        assert_ne!(cfg.host_label, "would-be-changed");
+        let _ = before;
     }
 }
