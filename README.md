@@ -50,9 +50,53 @@ Open the dashboard: **http://127.0.0.1:9090/** (or your bind address).
   - `X-SMOS-Token: <token>`
 - Default bind is **localhost**. For a public VPS, use a firewall, reverse proxy TLS, and set an auth token. Process kill without auth on `0.0.0.0` is unsafe.
 
-## Install on Ubuntu server
+## Install (one command)
 
-Copy-paste install for **Ubuntu 22.04 / 24.04** (and similar Debian-based VPS images).
+On a Linux VPS (Ubuntu/Debian recommended), install and start SMOS with a single command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | bash
+```
+
+That script (from this GitHub repo) will:
+
+1. Install build dependencies (apt/dnf when available)
+2. Install Rust via rustup if needed
+3. Clone and `cargo build --release` from `https://github.com/vantanminh/SMOS.git`
+4. Install binary + WebUI to `/opt/smos` and data dir `/var/lib/smos`
+5. Enable and start a `systemd` service (`smos`) bound to `127.0.0.1:9090`
+
+After install:
+
+```bash
+curl -sS http://127.0.0.1:9090/api/health
+# Dashboard: http://127.0.0.1:9090/  (or SSH tunnel / reverse proxy)
+systemctl status smos
+```
+
+Optional environment variables before/with the pipe:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SMOS_REF` | `main` | Git branch/tag to install |
+| `SMOS_BIND` | `127.0.0.1:9090` | HTTP bind address |
+| `SMOS_PREFIX` | `/opt/smos` | Install prefix |
+| `SMOS_DATA_DIR` | `/var/lib/smos` | Config, audit, logs |
+| `SMOS_SKIP_SERVICE` | `0` | Set `1` to skip systemd |
+| `SMOS_SKIP_DEPS` | `0` | Set `1` to skip apt/dnf |
+
+Example (custom bind, no systemd):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | \
+  SMOS_BIND=0.0.0.0:9090 SMOS_SKIP_SERVICE=1 bash
+```
+
+> **Trust note:** `curl | bash` runs remote code. Prefer pinning a tag (`SMOS_REF=v0.1.0`) once you publish releases, or review [`scripts/install.sh`](scripts/install.sh) first.
+
+## Install on Ubuntu server (manual steps)
+
+Copy-paste install for **Ubuntu 22.04 / 24.04** (and similar Debian-based VPS images). Prefer the [one-command installer](#install-one-command) above when possible.
 
 ```bash
 # 1) System packages
