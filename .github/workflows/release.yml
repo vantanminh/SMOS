@@ -1,13 +1,19 @@
 name: Release
 
+# Auto-publish a GitHub Release (prebuilt tarball) on every push to main.
+# Manual version tags (v1.2.3) still work; auto tags look like v0.1.0-build.42
+# so they do not re-trigger this workflow (see job if:).
+
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create/publish (e.g. v0.1.0). Leave empty to use run id draft name."
+        description: "Optional release tag (e.g. v0.1.0). Empty = auto v<cargo>-build.<run>."
         required: false
         default: ""
 
@@ -21,15 +27,42 @@ jobs:
   build-linux:
     name: Build Linux release assets
     runs-on: ubuntu-latest
+    # Skip re-entry when a previous run created an auto tag v*-build.N
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main' ||
+      (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-build.'))
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os_name: linux-x86_64
+    outputs:
+      version: ${{ steps.meta.outputs.ver }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve version label
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          if [[ -z "$CARGO_VER" ]]; then
+            CARGO_VER="0.0.0"
+          fi
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VER="${{ github.ref_name }}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
+            VER="${{ inputs.tag }}"
+          else
+            # Auto release for main (and empty dispatch): unique, installable tag
+            VER="v${CARGO_VER}-build.${{ github.run_number }}"
+          fi
+          echo "ver=${VER}" >> "$GITHUB_OUTPUT"
+          echo "cargo_ver=${CARGO_VER}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: ${VER}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -50,26 +83,17 @@ jobs:
         run: |
           set -euo pipefail
           TARGET="${{ matrix.target }}"
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
-            VER="${{ github.ref_name }}"
-          elif [[ -n "${{ inputs.tag }}" ]]; then
-            VER="${{ inputs.tag }}"
-          else
-            VER="v0.0.0-dev.${{ github.run_number }}"
-          fi
-          # strip leading v for inner version file optional
+          VER="${{ steps.meta.outputs.ver }}"
           STAGE="smos-${VER}-${TARGET}"
           mkdir -p "dist/${STAGE}"
           cp "target/${TARGET}/release/smos" "dist/${STAGE}/smos"
           chmod 755 "dist/${STAGE}/smos"
           cp -a static "dist/${STAGE}/static"
-          # checksum of binary for install verification
           (cd "dist/${STAGE}" && sha256sum smos > smos.sha256)
           TAR_NAME="${STAGE}.tar.gz"
           tar -C dist -czf "${TAR_NAME}" "${STAGE}"
           sha256sum "${TAR_NAME}" > "${TAR_NAME}.sha256"
           echo "tar_name=${TAR_NAME}" >> "$GITHUB_OUTPUT"
-          echo "ver=${VER}" >> "$GITHUB_OUTPUT"
           ls -la "${TAR_NAME}" "${TAR_NAME}.sha256"
 
       - name: Upload workflow artifact
@@ -84,8 +108,7 @@ jobs:
     name: Publish GitHub Release
     needs: build-linux
     runs-on: ubuntu-latest
-    # Tag pushes always publish; workflow_dispatch publishes when tag input set
-    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    if: needs.build-linux.result == 'success'
     steps:
       - name: Download assets
         uses: actions/download-artifact@v4
@@ -96,22 +119,28 @@ jobs:
       - name: List assets
         run: find assets -type f -ls || ls -laR assets
 
-      - name: Resolve tag name
-        id: tag
-        shell: bash
-        run: |
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
-            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create GitHub Release
+      - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          name: SMOS ${{ steps.tag.outputs.name }}
+          tag_name: ${{ needs.build-linux.outputs.version }}
+          name: SMOS ${{ needs.build-linux.outputs.version }}
+          # Latest successful main build is always "latest" for install.sh
+          make_latest: true
           generate_release_notes: true
+          body: |
+            Automated release from CI.
+
+            Install on a Linux server (no compile):
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | bash
+            ```
+
+            Pin this build:
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | SMOS_VERSION=${{ needs.build-linux.outputs.version }} bash
+            ```
           files: |
             assets/*.tar.gz
             assets/*.sha256

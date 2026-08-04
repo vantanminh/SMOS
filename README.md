@@ -87,19 +87,24 @@ Pin a version:
 curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | SMOS_VERSION=v0.1.0 bash
 ```
 
-### Publish a release (maintainers)
+### Releases are automatic (CI)
 
-CI builds Linux artifacts and attaches them to a GitHub Release when you push a version tag:
+You do **not** need to create tags by hand for installs to work.
+
+| Trigger | What happens |
+| --- | --- |
+| **Push to `main`** | Workflow **Release** builds Linux tarball and publishes a GitHub Release (`v<cargo-version>-build.<run>`, marked **latest**) |
+| **Manual tag** `v1.2.3` | Same workflow publishes that version (skipped for auto tags `*-build.*` to avoid loops) |
+| **Actions → Release → Run workflow** | Optional; empty tag = auto version |
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
-# → Actions workflow "Release" → github.com/vantanminh/SMOS/releases
+git push origin main
+# wait until https://github.com/vantanminh/SMOS/actions  → Release is green
+# then on the server:
+curl -fsSL https://raw.githubusercontent.com/vantanminh/SMOS/main/scripts/install.sh | bash
 ```
 
-Asset name pattern: `smos-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` (binary + `static/`).
-
-You can also run the **Release** workflow manually (`workflow_dispatch`) with a tag input.
+If install prints **404 / no GitHub Release**, the Release workflow has not finished (or failed) yet — open the Actions tab, wait for green, retry. Asset pattern: `smos-v…-x86_64-unknown-linux-gnu.tar.gz`.
 
 > **Trust note:** `curl | bash` runs remote code. Review [`scripts/install.sh`](scripts/install.sh) or pin `SMOS_VERSION`.
 

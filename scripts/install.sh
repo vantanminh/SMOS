@@ -104,10 +104,25 @@ resolve_asset_url() {
   fi
 
   log "fetching release metadata: ${api_url}"
-  json="$(curl -fsSL \
+  http_code=0
+  json="$(curl -fsSL -w '\n%{http_code}' \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
-    "${api_url}")" || die "failed to query GitHub releases (create a release tag v* first, or set SMOS_VERSION)"
+    "${api_url}" 2>/dev/null)" || true
+  # split body / code if -w appended
+  if printf '%s' "$json" | tail -n1 | grep -Eq '^[0-9]{3}$'; then
+    http_code="$(printf '%s' "$json" | tail -n1)"
+    json="$(printf '%s' "$json" | sed '$d')"
+  fi
+  if [ -z "$json" ] || [ "$http_code" = "404" ]; then
+    die "no GitHub Release found for ${SMOS_REPO} (${SMOS_VERSION}, HTTP ${http_code:-unknown}).
+  CI creates a release automatically on every push to main (tag like v0.1.0-build.N).
+  Check: https://github.com/${SMOS_REPO}/releases
+  Actions: https://github.com/${SMOS_REPO}/actions
+  After the Release workflow is green, re-run this installer.
+  Or pin: SMOS_VERSION=v0.1.0-build.1
+  Or build on server: SMOS_FROM_SOURCE=1"
+  fi
 
   # Prefer python for JSON if present; else grep/sed best-effort.
   ASSET_URL=""

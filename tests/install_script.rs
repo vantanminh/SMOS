@@ -105,8 +105,8 @@ fn release_workflow_builds_and_publishes_assets() {
     assert!(path.is_file(), "missing {}", path.display());
     let body = fs::read_to_string(&path).expect("read release.yml");
     assert!(
-        body.contains("tags:") || body.contains("v*"),
-        "release workflow should trigger on version tags"
+        body.contains("main") || body.contains("branches:"),
+        "release workflow should auto-run on main (not only manual tags)"
     );
     assert!(
         body.contains("cargo build --release"),
@@ -126,6 +126,10 @@ fn release_workflow_builds_and_publishes_assets() {
     assert!(
         body.contains("static"),
         "release package must include static WebUI assets"
+    );
+    assert!(
+        body.contains("make_latest") || body.contains("build."),
+        "auto releases should mark latest or use build.N tags"
     );
 }
 
