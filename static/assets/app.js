@@ -10,6 +10,8 @@
     metrics: null,
     metricsHistory: null,
     historyRangeHours: 24,
+    historyLoadedHours: null,
+    historyFetchedAt: 0,
     historyStatus: null,
     processes: [],
     processFilter: { name: "", sort: "cpu", order: "desc" },
@@ -333,12 +335,38 @@
     return "bar";
   }
 
+  /** Cap spark points client-side so 24h/30d history never paints hundreds of DOM nodes. */
+  function downsampleSeries(values, maxPts) {
+    const arr = values || [];
+    if (arr.length <= maxPts) return arr.map(Number);
+    const out = [];
+    const n = arr.length;
+    for (let i = 0; i < maxPts; i++) {
+      const idx = maxPts === 1 ? n - 1 : Math.round(i * (n - 1) / (maxPts - 1));
+      out.push(Number(arr[idx]) || 0);
+    }
+    return out;
+  }
+
   function spark(history) {
-    const max = Math.max(1, ...history, 1);
-    return `<div class="spark">${history.map(v => {
-      const h = Math.max(2, Math.round((v / max) * 100));
-      return `<i style="height:${h}%"></i>`;
-    }).join("")}</div>`;
+    const pts = downsampleSeries(history, 64);
+    if (!pts.length) return `<div class="spark spark-empty"></div>`;
+    const max = Math.max(1, ...pts);
+    const w = 120, h = 36, pad = 1;
+    const step = pts.length > 1 ? (w - pad * 2) / (pts.length - 1) : 0;
+    const coords = pts.map((v, i) => {
+      const x = pad + i * step;
+      const y = h - pad - ((v / max) * (h - pad * 2));
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    const poly = coords.join(" ");
+    const area = `${pad},${h - pad} ${poly} ${pad + (pts.length - 1) * step},${h - pad}`;
+    return `<div class="spark" aria-hidden="true">
+      <svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none">
+        <polygon points="${area}" class="spark-area" />
+        <polyline points="${poly}" class="spark-line" fill="none" />
+      </svg>
+    </div>`;
   }
 
   function setHealthPill(ok, text) {
@@ -507,6 +535,17 @@
     return samples.map(s => Number(s[key]) || 0);
   }
 
+  /** Adaptive server limit — fewer points for short windows, still capped for 30d. */
+  function historyPointLimit(hours) {
+    const h = hours || 24;
+    if (h <= 1) return 90;
+    if (h <= 6) return 120;
+    if (h <= 24) return 180;
+    if (h <= 72) return 220;
+    if (h <= 168) return 260;
+    return 300;
+  }
+
   function renderHistoryToolbar() {
     const hours = state.historyRangeHours || 24;
     const opts = [
@@ -516,23 +555,27 @@
       `<button type="button" class="chip ${hours === h ? "active" : ""}" data-hist-hours="${h}">${label}</button>`
     ).join("");
     const count = state.metricsHistory?.count ?? 0;
+    const matched = state.metricsHistory?.matched ?? count;
+    const down = state.metricsHistory?.downsampled;
     const ret = state.metricsHistory?.retention_days
       ?? state.config?.history_retention_days
       ?? 30;
+    const cpuSeries = historySeries("cpu");
+    const memSeries = historySeries("mem");
     return `
       <div class="card full">
         <h3>Stored history</h3>
-        <p class="muted">Samples every ${state.config?.metrics_history_interval_secs || 60}s · kept <strong>${ret} days</strong></p>
+        <p class="muted">Samples every ${state.config?.metrics_history_interval_secs || 60}s · kept <strong>${ret} days</strong> · charts use downsampled points for speed</p>
         <div class="chip-row" role="group" aria-label="History range">${buttons}</div>
-        <p class="muted" style="margin-top:0.55rem">${count} points · last ${hours}h</p>
+        <p class="muted" style="margin-top:0.55rem">${down ? `showing ${count} of ${matched}` : `${count} points`} · last ${hours}h</p>
         <div class="grid" style="margin-top:0.85rem">
           <div class="card">
             <h3>CPU history</h3>
-            ${spark(historySeries("cpu").length ? historySeries("cpu") : state.cpuHistory)}
+            ${spark(cpuSeries.length ? cpuSeries : state.cpuHistory)}
           </div>
           <div class="card">
             <h3>Memory history</h3>
-            ${spark(historySeries("mem").length ? historySeries("mem") : state.memHistory)}
+            ${spark(memSeries.length ? memSeries : state.memHistory)}
           </div>
         </div>
       </div>`;
@@ -687,23 +730,23 @@
     const sources = (state.logs || []).map(s =>
       `<option value="${esc(s.id)}" ${state.logTail && state.logTail.source_id === s.id ? "selected" : ""}>${esc(s.label)} ${s.exists ? "" : "(missing)"}</option>`
     ).join("");
-    const lines = (state.logTail?.lines || []).map(l => esc(l)).join("\n");
     const ret = state.config?.history_retention_days ?? 30;
     const histFiles = state.historyStatus?.log_files || [];
     const histNote = histFiles.length
       ? `${histFiles.length} log file(s) on disk · ${fmtBytes(state.historyStatus.log_bytes_total || 0)}`
       : "Daily log files appear under data dir as smos.log.YYYY-MM-DD";
+    const linePref = state.logLinePref || state.logTail?.line_count || 150;
     return `
       <div class="grid">
         <div class="card full">
           <h3>Log sources</h3>
-          <p class="muted">Service logs rotate daily and are retained for <strong>${ret} days</strong>. Older days appear as History sources below.</p>
+          <p class="muted">Service logs rotate daily and are retained for <strong>${ret} days</strong>. Tail is capped for performance — increase lines only when needed.</p>
           <div class="log-toolbar">
             <select id="log-source">${sources || '<option value="smos-service">smos-service</option>'}</select>
-            <label class="muted">Lines <input id="log-lines" type="number" min="10" max="5000" value="${state.logTail?.line_count || 200}" style="width:90px" /></label>
+            <label class="muted">Lines <input id="log-lines" type="number" min="10" max="1000" value="${Math.min(1000, linePref)}" style="width:90px" /></label>
             <button class="btn" id="log-load">Load</button>
           </div>
-          <div class="log-box" id="log-box">${lines || "No log lines yet."}</div>
+          <div class="log-box" id="log-box"></div>
           <div class="muted" style="margin-top:0.5rem">${state.logTail ? esc(state.logTail.path) + " · " + state.logTail.line_count + " lines" : ""} · ${esc(histNote)}</div>
         </div>
       </div>`;
@@ -845,11 +888,19 @@
       });
     });
 
+    // Fill log text via textContent (avoids huge HTML escape/join for thousands of lines).
+    const logBox = $("#log-box");
+    if (logBox) {
+      const raw = (state.logTail?.lines || []);
+      logBox.textContent = raw.length ? raw.join("\n") : "No log lines yet.";
+    }
+
     const logLoad = $("#log-load");
     if (logLoad) {
       logLoad.addEventListener("click", async () => {
         const id = $("#log-source").value;
-        const lines = Number($("#log-lines").value) || 200;
+        const lines = Math.min(1000, Math.max(10, Number($("#log-lines").value) || 150));
+        state.logLinePref = lines;
         try {
           state.logTail = await api(`/logs/${encodeURIComponent(id)}?lines=${lines}`);
           render();
@@ -863,7 +914,7 @@
       btn.addEventListener("click", async () => {
         state.historyRangeHours = Number(btn.dataset.histHours) || 24;
         try {
-          await loadMetricsHistory();
+          await loadMetricsHistory(true);
           render();
         } catch (e) {
           alert(e.message);
@@ -1013,13 +1064,31 @@
     state.alerts = await api("/alerts");
   }
 
-  async function loadMetricsHistory() {
+  async function loadMetricsHistory(force) {
     const hours = state.historyRangeHours || 24;
-    state.metricsHistory = await api(`/metrics/history?hours=${hours}&limit=500`);
+    const limit = historyPointLimit(hours);
+    // Cache: skip re-fetch within 30s for same window (poll/refresh spam).
+    const now = Date.now();
+    if (
+      !force &&
+      state.metricsHistory &&
+      state.historyLoadedHours === hours &&
+      now - (state.historyFetchedAt || 0) < 30_000
+    ) {
+      return;
+    }
+    state.metricsHistory = await api(`/metrics/history?hours=${hours}&limit=${limit}`);
+    state.historyLoadedHours = hours;
+    state.historyFetchedAt = now;
   }
 
-  async function loadHistoryStatus() {
+  async function loadHistoryStatus(force) {
+    const now = Date.now();
+    if (!force && state.historyStatus && now - (state.historyStatusFetchedAt || 0) < 60_000) {
+      return;
+    }
     state.historyStatus = await api("/history");
+    state.historyStatusFetchedAt = now;
   }
 
   async function loadProcesses() {
@@ -1035,9 +1104,10 @@
 
   async function loadLogs() {
     state.logs = await api("/logs");
-    try { await loadHistoryStatus(); } catch { /* optional */ }
+    try { await loadHistoryStatus(false); } catch { /* optional */ }
     if (!state.logTail && state.logs[0]) {
-      state.logTail = await api(`/logs/${encodeURIComponent(state.logs[0].id)}?lines=200`);
+      const lines = state.logLinePref || 150;
+      state.logTail = await api(`/logs/${encodeURIComponent(state.logs[0].id)}?lines=${lines}`);
     }
   }
 
@@ -1060,8 +1130,9 @@
         try { await loadAlerts(); } catch { /* optional */ }
       }
       if (state.route === "processes" || state.route === "overview") await loadProcesses();
-      if (state.route === "metrics" || state.route === "overview") {
-        try { await loadMetricsHistory(); } catch { /* empty history ok */ }
+      // Overview: skip full history (live sparks only). Metrics page loads chart history.
+      if (state.route === "metrics") {
+        try { await loadMetricsHistory(false); } catch { /* empty history ok */ }
       }
       if (state.route === "logs") await loadLogs();
       if (state.route === "config") await loadConfig();

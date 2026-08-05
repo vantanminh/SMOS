@@ -285,12 +285,57 @@ async fn metrics_history_and_status() {
     assert!(samples.len() >= 2, "expected seeded samples: {hist}");
     assert!(samples[0]["cpu"].as_f64().is_some());
     assert!(samples[0]["mem"].as_f64().is_some());
+    // Compact chart points — no heavy disk arrays in history payload.
+    assert!(samples[0].get("disks").is_none());
+    assert!(hist["matched"].as_u64().unwrap() >= 2);
+    assert!(hist["downsampled"].as_bool().is_some());
 
     let (st, status) = json_get_auth(&app, "/api/history", Some(&token)).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(status["retention_days"], 30);
     assert!(status["metrics_samples_on_disk"].as_u64().unwrap() >= 2);
     assert!(status["metrics_bytes"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn metrics_history_downsamples_large_sets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, token) = test_state_authed(dir.path());
+    let app = api::router(state, resolve_static_dir());
+
+    // Seed many samples (more than limit).
+    for i in 0..80 {
+        let mut s = smos::history::MetricsSample {
+            t: chrono::Utc::now() - chrono::Duration::minutes(80 - i),
+            cpu: i as f32,
+            mem: 40.0,
+            mem_used: 1,
+            mem_total: 2,
+            swap_used: 0,
+            swap_total: 0,
+            disks: vec![smos::history::DiskSample {
+                mount: "/".into(),
+                used: 1,
+                total: 2,
+                pct: 50.0,
+            }],
+            load: None,
+            uptime_secs: 1,
+        };
+        // keep t unique chronological
+        let _ = i;
+        smos::history::append_metrics_sample(dir.path(), &s).unwrap();
+        s.cpu = i as f32; // silence unused mut warning path
+    }
+
+    let (st, hist) =
+        json_get_auth(&app, "/api/metrics/history?hours=24&limit=20", Some(&token)).await;
+    assert_eq!(st, StatusCode::OK);
+    let samples = hist["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 20, "must downsample to limit: {hist}");
+    assert_eq!(hist["count"], 20);
+    assert!(hist["matched"].as_u64().unwrap() >= 20);
+    assert_eq!(hist["downsampled"], true);
 }
 
 #[tokio::test]

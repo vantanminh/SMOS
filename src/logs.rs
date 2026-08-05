@@ -61,8 +61,10 @@ pub fn tail_file(path: &Path, max_lines: usize) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
 
-    // Read up to 1 MiB from the end for tailing.
-    let window = 1024 * 1024u64;
+    // Scale read window with requested lines (~256 bytes/line estimate), clamp 64 KiB..=2 MiB.
+    // Avoid reading a full 1 MiB when the UI only wants 150 lines.
+    let est = (max_lines as u64).saturating_mul(256).max(64 * 1024);
+    let window = est.min(2 * 1024 * 1024);
     let start = len.saturating_sub(window);
     file.seek(SeekFrom::Start(start))?;
 
@@ -75,8 +77,22 @@ pub fn tail_file(path: &Path, max_lines: usize) -> Result<Vec<String>> {
         lines.remove(0);
     }
 
-    let truncated = lines.len() > max_lines;
-    if truncated {
+    // If the window did not yield enough lines and more file exists, expand once (up to 4 MiB).
+    if lines.len() < max_lines && start > 0 {
+        let bigger = (window.saturating_mul(2)).min(4 * 1024 * 1024).min(len);
+        let start2 = len.saturating_sub(bigger);
+        if start2 < start {
+            file.seek(SeekFrom::Start(start2))?;
+            buf.clear();
+            file.read_to_string(&mut buf)?;
+            lines = buf.lines().map(|s| s.to_string()).collect();
+            if start2 > 0 && !lines.is_empty() {
+                lines.remove(0);
+            }
+        }
+    }
+
+    if lines.len() > max_lines {
         let skip = lines.len() - max_lines;
         lines = lines.split_off(skip);
     }
@@ -105,8 +121,8 @@ pub fn tail_source(
     path: &Path,
     max_lines: usize,
 ) -> Result<LogTail> {
-    if max_lines == 0 || max_lines > 50_000 {
-        bail!("max_lines must be 1..=50000");
+    if max_lines == 0 || max_lines > 5_000 {
+        bail!("max_lines must be 1..=5000");
     }
     let lines = tail_file(path, max_lines)?;
     let line_count = lines.len();

@@ -106,7 +106,7 @@ pub struct MetricsHistoryQuery {
     pub to: Option<String>,
     /// Lookback window in hours when `from`/`to` omitted (default 24, max 87600).
     pub hours: Option<u64>,
-    /// Max samples returned after downsampling (default 500, max 5000).
+    /// Max chart points after downsampling (default adaptive by hours, max 1000).
     pub limit: Option<usize>,
 }
 
@@ -518,7 +518,13 @@ async fn get_metrics_history(
     Query(q): Query<MetricsHistoryQuery>,
 ) -> Result<Json<MetricsHistoryResponse>, (StatusCode, Json<ApiError>)> {
     let cfg = state.inner.config.read().clone();
-    let limit = q.limit.unwrap_or(500).clamp(1, 5_000);
+
+    let hours_hint = q.hours.unwrap_or(24).clamp(1, 24 * 365 * 10);
+    let default_limit = history::chart_points_for_hours(hours_hint);
+    let limit = q
+        .limit
+        .unwrap_or(default_limit)
+        .clamp(1, history::MAX_CHART_POINTS);
 
     let (from, to) = match (q.from.as_deref(), q.to.as_deref()) {
         (Some(f), Some(t)) => {
@@ -542,8 +548,8 @@ async fn get_metrics_history(
     };
 
     let data_dir = cfg.data_dir.clone();
-    let samples = tokio::task::spawn_blocking(move || {
-        history::query_metrics(&data_dir, from, to, limit)
+    let (samples, matched) = tokio::task::spawn_blocking(move || {
+        history::query_metrics_chart(&data_dir, from, to, limit)
     })
     .await
     .map_err(|e| {
@@ -569,6 +575,8 @@ async fn get_metrics_history(
         from,
         to,
         count,
+        matched,
+        downsampled: matched > count,
         retention_days: cfg.history_retention_days,
         sample_interval_secs: cfg.metrics_history_interval_secs,
     }))
@@ -713,7 +721,8 @@ async fn get_log_tail(
     Query(q): Query<LogQuery>,
 ) -> Result<Json<LogTail>, (StatusCode, Json<ApiError>)> {
     let cfg = state.inner.config.read().clone();
-    let max_lines = q.lines.unwrap_or(cfg.log_tail_lines).clamp(1, 50_000);
+    // Cap tail size to keep API/UI responsive (UI default is much lower).
+    let max_lines = q.lines.unwrap_or(cfg.log_tail_lines.min(500)).clamp(1, 5_000);
 
     let path = if source_id == SERVICE_LOG_ID {
         SmosConfig::service_log_path(&cfg.data_dir)

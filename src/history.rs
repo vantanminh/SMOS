@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 /// Default sample interval for persisted metrics (seconds).
 pub const DEFAULT_METRICS_SAMPLE_SECS: u64 = 60;
 
+/// Default chart point budget (enough for smooth sparklines, small payloads).
+pub const DEFAULT_CHART_POINTS: usize = 240;
+
+/// Hard cap on chart points returned by the history API.
+pub const MAX_CHART_POINTS: usize = 1_000;
+
 /// Compact on-disk metrics sample (one JSONL line).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MetricsSample {
@@ -26,6 +32,22 @@ pub struct MetricsSample {
     pub uptime_secs: u64,
 }
 
+/// Lightweight chart point (API + UI). Omits disks/swap for small JSON payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MetricsChartPoint {
+    pub t: DateTime<Utc>,
+    pub cpu: f32,
+    pub mem: f64,
+}
+
+/// Deserialize only fields needed for range filter + charts (skip heavy disks arrays).
+#[derive(Debug, Deserialize)]
+struct SlimMetricsLine {
+    t: DateTime<Utc>,
+    cpu: f32,
+    mem: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiskSample {
     pub mount: String,
@@ -36,10 +58,14 @@ pub struct DiskSample {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricsHistoryResponse {
-    pub samples: Vec<MetricsSample>,
+    pub samples: Vec<MetricsChartPoint>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
+    /// Points returned after downsampling.
     pub count: usize,
+    /// Matching samples in range before downsampling (for UI “showing N of M”).
+    pub matched: usize,
+    pub downsampled: bool,
     pub retention_days: u32,
     pub sample_interval_secs: u64,
 }
@@ -115,9 +141,10 @@ pub fn append_metrics_sample(data_dir: &Path, sample: &MetricsSample) -> Result<
     Ok(())
 }
 
-/// Query samples in `[from, to]` (inclusive bounds when set), oldest-first, optional max points.
+/// Query full samples in `[from, to]` (inclusive bounds when set), oldest-first.
 ///
-/// When more samples exist than `max_points`, evenly downsamples for chart-friendly payloads.
+/// Prefer [`query_metrics_chart`] for dashboard charts — it is cheaper and returns compact points.
+/// `max_points == 0` means no downsample cap (use carefully on large files).
 pub fn query_metrics(
     data_dir: &Path,
     from: Option<DateTime<Utc>>,
@@ -157,14 +184,79 @@ pub fn query_metrics(
         }
         samples.push(sample);
     }
-    // File is append-only chronological; keep order.
     if max_points > 0 && samples.len() > max_points {
         samples = downsample(samples, max_points);
     }
     Ok(samples)
 }
 
-fn downsample(samples: Vec<MetricsSample>, max_points: usize) -> Vec<MetricsSample> {
+/// Chart-oriented query: slim JSON parse (no disks), range filter, even downsample.
+///
+/// Returns `(points, matched_before_downsample)`.
+pub fn query_metrics_chart(
+    data_dir: &Path,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    max_points: usize,
+) -> Result<(Vec<MetricsChartPoint>, usize)> {
+    let path = metrics_history_path(data_dir);
+    if !path.exists() {
+        return Ok((Vec::new(), 0));
+    }
+    let file = File::open(&path)
+        .with_context(|| format!("read metrics history {}", path.display()))?;
+    // Larger buffer reduces syscalls on multi-MB history files.
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    let mut points: Vec<MetricsChartPoint> = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let sample: SlimMetricsLine = match serde_json::from_str(line) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!("skip corrupt metrics history line: {err}");
+                continue;
+            }
+        };
+        if let Some(from) = from {
+            if sample.t < from {
+                continue;
+            }
+        }
+        if let Some(to) = to {
+            if sample.t > to {
+                continue;
+            }
+        }
+        points.push(MetricsChartPoint {
+            t: sample.t,
+            cpu: sample.cpu,
+            mem: sample.mem,
+        });
+    }
+    let matched = points.len();
+    if max_points > 0 && points.len() > max_points {
+        points = downsample(points, max_points);
+    }
+    Ok((points, matched))
+}
+
+/// Suggest a chart point budget from the lookback window (UI/API default).
+pub fn chart_points_for_hours(hours: u64) -> usize {
+    match hours {
+        0..=1 => 90,
+        2..=6 => 120,
+        7..=24 => 180,
+        25..=72 => 220,
+        73..=168 => 260,
+        _ => DEFAULT_CHART_POINTS,
+    }
+}
+
+fn downsample<T: Clone>(samples: Vec<T>, max_points: usize) -> Vec<T> {
     if samples.len() <= max_points || max_points == 0 {
         return samples;
     }
@@ -179,6 +271,41 @@ fn downsample(samples: Vec<MetricsSample>, max_points: usize) -> Vec<MetricsSamp
         out.push(samples[idx].clone());
     }
     out
+}
+
+/// Count lines + first/last timestamps without materializing every sample body.
+pub fn metrics_file_summary(data_dir: &Path) -> Result<(usize, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
+    let path = metrics_history_path(data_dir);
+    if !path.exists() {
+        return Ok((0, None, None));
+    }
+    let file = File::open(&path)
+        .with_context(|| format!("read metrics history {}", path.display()))?;
+    let reader = BufReader::with_capacity(256 * 1024, file);
+    let mut count = 0usize;
+    let mut oldest: Option<DateTime<Utc>> = None;
+    let mut newest: Option<DateTime<Utc>> = None;
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Only parse timestamp field when we need first/last (still O(n) scan but tiny structs).
+        #[derive(Deserialize)]
+        struct TsOnly {
+            t: DateTime<Utc>,
+        }
+        let Ok(ts) = serde_json::from_str::<TsOnly>(trimmed) else {
+            continue;
+        };
+        count += 1;
+        if oldest.is_none() {
+            oldest = Some(ts.t);
+        }
+        newest = Some(ts.t);
+    }
+    Ok((count, oldest, newest))
 }
 
 /// Drop metrics samples older than `retention_days`. Rewrites the file when needed.
@@ -307,15 +434,14 @@ pub fn prune_all(data_dir: &Path, retention_days: u32) -> Result<(usize, usize)>
 pub fn history_status(data_dir: &Path, retention_days: u32) -> Result<HistoryStatus> {
     let path = metrics_history_path(data_dir);
     let metrics_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let samples = query_metrics(data_dir, None, None, 0)?;
-    let metrics_oldest = samples.first().map(|s| s.t);
-    let metrics_newest = samples.last().map(|s| s.t);
+    // Cheap summary — do not load every full sample (was O(n) full deserialize).
+    let (count, metrics_oldest, metrics_newest) = metrics_file_summary(data_dir)?;
     let log_files = list_log_history_files(data_dir)?;
     let log_bytes_total = log_files.iter().map(|f| f.size_bytes).sum();
     Ok(HistoryStatus {
         retention_days,
         metrics_path: path.to_string_lossy().to_string(),
-        metrics_samples_on_disk: samples.len(),
+        metrics_samples_on_disk: count,
         metrics_oldest,
         metrics_newest,
         metrics_bytes,
@@ -394,6 +520,50 @@ mod tests {
         // First and last preserved approximately
         assert_eq!(q.first().unwrap().cpu, 0.0);
         assert_eq!(q.last().unwrap().cpu, 99.0);
+
+        let (chart, matched) = query_metrics_chart(dir.path(), None, None, 10).unwrap();
+        assert_eq!(matched, 100);
+        assert_eq!(chart.len(), 10);
+        assert_eq!(chart.first().unwrap().cpu, 0.0);
+        assert_eq!(chart.last().unwrap().cpu, 99.0);
+    }
+
+    #[test]
+    fn chart_query_skips_out_of_range_and_is_compact() {
+        let dir = tempdir().unwrap();
+        let data = dir.path();
+        // Old samples + recent
+        for i in 0..20 {
+            let mut s = sample_at(0, i as f32);
+            s.t = Utc::now() - Duration::hours(48) + Duration::minutes(i);
+            append_metrics_sample(data, &s).unwrap();
+        }
+        for i in 0..30 {
+            append_metrics_sample(data, &sample_at(i, 50.0 + i as f32)).unwrap();
+        }
+        let from = Utc::now() - Duration::hours(1);
+        let (pts, matched) = query_metrics_chart(data, Some(from), None, 15).unwrap();
+        assert!(matched <= 30, "only recent samples match: matched={matched}");
+        assert!(pts.len() <= 15);
+        assert!(pts.iter().all(|p| p.t >= from));
+    }
+
+    #[test]
+    fn metrics_file_summary_does_not_need_full_samples() {
+        let dir = tempdir().unwrap();
+        append_metrics_sample(dir.path(), &sample_at(10, 1.0)).unwrap();
+        append_metrics_sample(dir.path(), &sample_at(0, 2.0)).unwrap();
+        let (n, oldest, newest) = metrics_file_summary(dir.path()).unwrap();
+        assert_eq!(n, 2);
+        assert!(oldest.is_some() && newest.is_some());
+        assert!(oldest.unwrap() <= newest.unwrap());
+    }
+
+    #[test]
+    fn chart_points_for_hours_scales() {
+        assert!(chart_points_for_hours(1) < chart_points_for_hours(24));
+        assert!(chart_points_for_hours(24) <= DEFAULT_CHART_POINTS);
+        assert!(chart_points_for_hours(720) <= MAX_CHART_POINTS);
     }
 
     #[test]

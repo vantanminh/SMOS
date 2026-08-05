@@ -228,7 +228,7 @@ sudo chown -R smos:smos /var/lib/smos
 | POST | `/api/auth/totp/enable` | `{code}` enable 2FA |
 | POST | `/api/auth/totp/disable` | `{password,code}` disable 2FA |
 | GET | `/api/metrics` | Live host metrics snapshot (CPU, memory, disks, **networks**) |
-| GET | `/api/metrics/history?hours=N&limit=M` | Stored metrics samples (default last 24h) |
+| GET | `/api/metrics/history?hours=N&limit=M` | Chart history (compact `cpu`/`mem` points, auto-downsampled; default limit by window) |
 | GET | `/api/history` | History storage status (sizes, counts, log files) |
 | GET | `/api/alerts` | Live threshold breach status vs configured CPU/memory/disk percents |
 | GET | `/api/processes` | Process list (optional query filters — see below) |

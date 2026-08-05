@@ -375,19 +375,27 @@ input:focus, select:focus, textarea:focus {
 .bar.danger > span { background: linear-gradient(90deg, var(--danger), #ff8a9a); }
 
 .spark {
-  display: flex;
-  align-items: flex-end;
-  gap: 2px;
-  height: 56px;
+  height: 40px;
   margin-top: 0.75rem;
+  width: 100%;
 }
-.spark i {
-  flex: 1;
+.spark svg {
   display: block;
-  min-height: 2px;
-  min-width: 2px;
-  border-radius: 3px 3px 0 0;
-  background: linear-gradient(180deg, var(--accent), rgba(61,214,198,0.2));
+  width: 100%;
+  height: 36px;
+}
+.spark-line {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.spark-area {
+  fill: rgba(61, 214, 198, 0.18);
+}
+.spark-empty {
+  background: linear-gradient(90deg, transparent, rgba(36, 48, 73, 0.6), transparent);
+  border-radius: 6px;
 }
 
 /* Tables */
